@@ -1,0 +1,50 @@
+name: Feature Request
+description: Suggest a new provider, resource type, or feature
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea? We'd love to hear it. The most requested features get built first.
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: What kind of feature?
+      options:
+        - New cloud provider
+        - New resource type (e.g. CDN, serverless, Kubernetes)
+        - New CLI command or flag
+        - Output format / integration
+        - Pricing accuracy improvement
+        - Developer experience
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the feature
+      placeholder: "I'd like cloudslayer to support Fly.io compute instances..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Why would this be useful?
+      placeholder: "Fly.io is popular for latency-sensitive workloads and their pricing..."
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      placeholder: "I've tried using X but it doesn't work because..."
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Are you willing to contribute this?
+      options:
+        - label: I'd like to submit a PR for this

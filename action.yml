@@ -1,0 +1,42 @@
+name: "cloudslayer"
+description: "Cross-cloud cost comparison for Terraform — see what your infra costs on AWS, GCP, and Azure, right in your PR"
+author: "cloudslayer contributors"
+branding:
+  icon: "cloud"
+  color: "blue"
+
+inputs:
+  args:
+    description: "Arguments passed to the cloudslayer CLI (e.g. 'plan infra.hcl --format markdown')"
+    required: true
+  version:
+    description: "cloudslayer version to install (PyPI version specifier, default: latest)"
+    required: false
+    default: ""
+
+outputs:
+  report:
+    description: "Path to the generated report file"
+    value: ${{ steps.run.outputs.report }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+
+    - name: Install cloudslayer
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.version }}" ]; then
+          uv tool install "cloudslayer==${{ inputs.version }}"
+        else
+          uv tool install cloudslayer
+        fi
+
+    - name: Run cloudslayer
+      id: run
+      shell: bash
+      run: |
+        cloudslayer ${{ inputs.args }} | tee cloudslayer-report.md
+        echo "report=cloudslayer-report.md" >> "$GITHUB_OUTPUT"

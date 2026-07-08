@@ -1,0 +1,70 @@
+name: Bug Report
+description: Something isn't working as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill in as much detail as possible.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug.
+      placeholder: "When I run `cloudslayer plan infra.hcl`, it outputs..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      placeholder: "I expected it to show..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Create infra.hcl with content...
+        2. Run `cloudslayer plan infra.hcl`
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: hcl
+    attributes:
+      label: Your .hcl spec (if applicable)
+      render: hcl
+
+  - type: input
+    id: version
+    attributes:
+      label: cloudslayer version
+      description: Run `cloudslayer version` to find this
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows
+    validations:
+      required: true
