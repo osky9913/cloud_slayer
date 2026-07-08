@@ -8,7 +8,8 @@ from pathlib import Path
 
 import requests
 
-from ....config import get_azure_region
+from ....config import fallback_prices_enabled, force_live_prices_enabled, get_azure_region
+from ....pricing import PricingUnavailableError
 from ..base import ComputeProvider, InstanceType
 
 CACHE_DIR = Path.home() / ".cloudslayer" / "cache"
@@ -114,7 +115,15 @@ def _notes(name: str) -> str:
 
 
 _CATALOG = [
-    InstanceType(name, vcpu, mem, _FALLBACK_PRICES[name], _notes(name))
+    InstanceType(
+        name,
+        vcpu,
+        mem,
+        _FALLBACK_PRICES[name],
+        _notes(name),
+        "fallback",
+        "https://azure.microsoft.com/pricing/details/virtual-machines/linux/",
+    )
     for name, (vcpu, mem) in _VM_SPECS.items()
 ]
 
@@ -131,15 +140,24 @@ class AzureComputeProvider(ComputeProvider):
     def catalog(self) -> list[InstanceType]:
         try:
             return self._live_catalog()
-        except Exception:
-            return _CATALOG
+        except Exception as error:
+            if fallback_prices_enabled():
+                return _CATALOG
+            raise PricingUnavailableError(
+                self.display_name,
+                f"live pricing unavailable ({error}); rerun with --fallback to use verified static Azure prices",
+            ) from error
 
     def _live_catalog(self) -> list[InstanceType]:
         region = get_azure_region()
         cache_file = CACHE_DIR / f"azure_compute_{region}.json"
-        if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < CACHE_TTL:
+        if (
+            not force_live_prices_enabled()
+            and cache_file.exists()
+            and (time.time() - cache_file.stat().st_mtime) < CACHE_TTL
+        ):
             with open(cache_file) as f:
-                return self._build_catalog(json.load(f))
+                return self._build_catalog(json.load(f), "cache")
         return self._fetch_and_cache(cache_file)
 
     def _fetch_and_cache(self, cache_file: Path) -> list[InstanceType]:
@@ -163,9 +181,9 @@ class AzureComputeProvider(ComputeProvider):
             params = None
         with open(cache_file, "w") as f:
             json.dump(items, f)
-        return self._build_catalog(items)
+        return self._build_catalog(items, "live")
 
-    def _build_catalog(self, items: list) -> list[InstanceType]:
+    def _build_catalog(self, items: list, source: str = "live") -> list[InstanceType]:
         size_price: dict[str, float] = {}
         for item in items:
             sku = item.get("armSkuName", "")
@@ -181,8 +199,19 @@ class AzureComputeProvider(ComputeProvider):
 
         result = [
             InstanceType(
-                name, vcpu, mem, size_price.get(name, _FALLBACK_PRICES[name]), _notes(name)
+                name,
+                vcpu,
+                mem,
+                size_price.get(name, _FALLBACK_PRICES[name]),
+                _notes(name),
+                source if name in size_price else "fallback",
+                "https://azure.microsoft.com/pricing/details/virtual-machines/linux/",
             )
             for name, (vcpu, mem) in _VM_SPECS.items()
+            if name in size_price or fallback_prices_enabled()
         ]
-        return result if result else _CATALOG
+        if result:
+            return result
+        if fallback_prices_enabled():
+            return _CATALOG
+        raise ValueError("Azure Retail Prices API returned no supported Linux VM prices")

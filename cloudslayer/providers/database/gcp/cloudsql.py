@@ -1,11 +1,4 @@
-"""GCP Cloud SQL provider — live prices via Cloud Billing Catalog API (ADC or API key).
-
-Live pricing requires one of:
-  • Application Default Credentials:  gcloud auth application-default login
-  • Environment variable:             GCP_BILLING_API_KEY=AIza...
-
-Falls back to hardcoded verified prices when neither is available.
-"""
+"""GCP Cloud SQL pricing from the authenticated Cloud Billing Catalog API."""
 
 from __future__ import annotations
 
@@ -16,15 +9,14 @@ from pathlib import Path
 
 import requests
 
+from ....config import force_live_prices_enabled, get_gcp_region
+from ....pricing import PricingUnavailableError
 from ..base import DatabasePlan, DatabaseProvider
 
 CACHE_DIR = Path.home() / ".cloudslayer" / "cache"
 CACHE_TTL = 7 * 24 * 3600
-
 _CLOUDSQL_SERVICE_ID = "9662-B51E-5089"
-
-_STORAGE_PER_GB = 0.17  # SSD persistent disk, us-east1
-_INCLUDED_STORAGE_GB = 10.0
+_SOURCE_URL = "https://cloud.google.com/sql/pricing"
 
 _PLAN_SPECS: dict[str, tuple[int, float]] = {
     "db-g1-small": (1, 1.7),
@@ -35,21 +27,7 @@ _PLAN_SPECS: dict[str, tuple[int, float]] = {
     "db-n1-highmem-2": (2, 13.0),
     "db-n1-highmem-4": (4, 26.0),
 }
-
-# Fractional vCPU for shared-core db-g1-small
-_EFFECTIVE_VCPU: dict[str, float] = {
-    "db-g1-small": 0.5,
-}
-
-_FALLBACK_PRICES: dict[str, float] = {
-    "db-g1-small": 25.14,
-    "db-n1-standard-1": 46.57,
-    "db-n1-standard-2": 93.14,
-    "db-n1-standard-4": 186.28,
-    "db-n1-standard-8": 372.57,
-    "db-n1-highmem-2": 124.19,
-    "db-n1-highmem-4": 248.37,
-}
+_EFFECTIVE_VCPU = {"db-g1-small": 0.5}
 
 
 def _notes(name: str) -> str:
@@ -58,14 +36,6 @@ def _notes(name: str) -> str:
     if name == "db-g1-small":
         return "Shared vCPU, PostgreSQL"
     return "Standard, PostgreSQL"
-
-
-_PLANS = [
-    DatabasePlan(
-        name, vcpu, mem, _FALLBACK_PRICES[name], _STORAGE_PER_GB, _INCLUDED_STORAGE_GB, _notes(name)
-    )
-    for name, (vcpu, mem) in _PLAN_SPECS.items()
-]
 
 
 class GCPCloudSQLProvider(DatabaseProvider):
@@ -80,30 +50,30 @@ class GCPCloudSQLProvider(DatabaseProvider):
     def plans(self) -> list[DatabasePlan]:
         try:
             return self._live_plans()
-        except Exception:
-            return _PLANS
+        except Exception as error:
+            raise PricingUnavailableError(
+                self.display_name,
+                f"live pricing unavailable ({error}); configure Application Default Credentials or GCP_BILLING_API_KEY",
+            ) from error
 
     def _live_plans(self) -> list[DatabasePlan]:
-        cache_file = CACHE_DIR / "gcp_cloudsql_prices.json"
-        if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < CACHE_TTL:
-            with open(cache_file) as f:
-                return _build_plans(json.load(f))
-        try:
-            prices = _fetch_billing_api()
-        except Exception:
-            prices = None
+        region = get_gcp_region()
+        cache_file = CACHE_DIR / f"gcp_cloudsql_prices_{region}.json"
+        if (
+            not force_live_prices_enabled()
+            and cache_file.exists()
+            and (time.time() - cache_file.stat().st_mtime) < CACHE_TTL
+        ):
+            with open(cache_file) as file:
+                return _build_plans(json.load(file), "cache")
 
-        if prices:
-            cache_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(cache_file, "w") as f:
-                json.dump(prices, f)
-            return _build_plans(prices)
-
-        if cache_file.exists():
-            with open(cache_file) as f:
-                return _build_plans(json.load(f))
-
-        raise RuntimeError("no live GCP Cloud SQL prices available")
+        pricing = _fetch_billing_api()
+        if not pricing:
+            raise RuntimeError("no GCP credentials for the Cloud Billing Catalog API")
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_file, "w") as file:
+            json.dump(pricing, file)
+        return _build_plans(pricing, "live")
 
 
 def _billing_session():
@@ -128,15 +98,13 @@ def _billing_session():
                 return requests.get(url, params=params, **kwargs)
 
         return _KeySession()
-
     return None
 
 
-def _fetch_billing_api() -> dict[str, float] | None:
+def _fetch_billing_api() -> dict | None:
     session = _billing_session()
     if session is None:
         return None
-
     url = f"https://cloudbilling.googleapis.com/v1/services/{_CLOUDSQL_SERVICE_ID}/skus"
     skus: list[dict] = []
     page_token = None
@@ -144,71 +112,83 @@ def _fetch_billing_api() -> dict[str, float] | None:
         params: dict = {"pageSize": 500, "currencyCode": "USD"}
         if page_token:
             params["pageToken"] = page_token
-        resp = session.get(url, params=params, timeout=30)
-        resp.raise_for_status()
-        body = resp.json()
+        response = session.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        body = response.json()
         skus.extend(body.get("skus", []))
         page_token = body.get("nextPageToken")
         if not page_token:
             break
+    return _calculate_pricing(skus) or None
 
-    return _calculate_prices(skus) or None
 
-
-def _extract_hourly_rate(sku: dict) -> float:
+def _first_rate(sku: dict) -> tuple[float, str]:
     for info in sku.get("pricingInfo", []):
-        expr = info.get("pricingExpression", {})
-        if expr.get("usageUnit") != "h":
-            continue
-        tiers = expr.get("tieredRates", [])
+        expression = info.get("pricingExpression", {})
+        tiers = expression.get("tieredRates", [])
         if tiers:
-            u = tiers[0].get("unitPrice", {})
-            return int(u.get("units", 0)) + int(u.get("nanos", 0)) / 1e9
-    return 0.0
+            unit = tiers[0].get("unitPrice", {})
+            rate = int(unit.get("units", 0)) + int(unit.get("nanos", 0)) / 1e9
+            return rate, expression.get("usageUnitDescription", "").lower()
+    return 0.0, ""
 
 
-def _calculate_prices(skus: list[dict]) -> dict[str, float]:
-    """Extract per-vCPU and per-RAM rates for Cloud SQL N1 in us-east1."""
-    cpu_rate = 0.0
-    ram_rate = 0.0
-
+def _calculate_pricing(skus: list[dict]) -> dict:
+    region = get_gcp_region()
+    cpu_rate = ram_rate = storage_rate = 0.0
     for sku in skus:
-        desc = sku.get("description", "")
-        if "us-east1" not in sku.get("serviceRegions", []):
+        description = sku.get("description", "").lower()
+        if region not in sku.get("serviceRegions", []):
             continue
         if sku.get("category", {}).get("usageType") != "OnDemand":
             continue
-        if "PostgreSQL" not in desc and "MySQL" not in desc and "SQL Server" not in desc:
+        if "postgres" not in description:
             continue
-        hourly = _extract_hourly_rate(sku)
-        if hourly <= 0:
+        rate, unit = _first_rate(sku)
+        if rate <= 0:
             continue
-        desc_lower = desc.lower()
-        if "core" in desc_lower and "n1" in desc_lower and not cpu_rate:
-            cpu_rate = hourly
-        elif "ram" in desc_lower and "n1" in desc_lower and not ram_rate:
-            ram_rate = hourly
+        if "core" in description and "n1" in description and "hour" in unit and not cpu_rate:
+            cpu_rate = rate
+        elif "ram" in description and "n1" in description and "hour" in unit and not ram_rate:
+            ram_rate = rate
+        elif (
+            "ssd" in description
+            and "storage" in description
+            and "gibibyte month" in unit
+            and not storage_rate
+        ):
+            storage_rate = rate / 1.073741824
 
-    if not cpu_rate or not ram_rate:
+    if not cpu_rate or not ram_rate or not storage_rate:
         return {}
+    prices = {
+        name: round(
+            (_EFFECTIVE_VCPU.get(name, float(vcpu)) * cpu_rate + memory * ram_rate) * 730, 2
+        )
+        for name, (vcpu, memory) in _PLAN_SPECS.items()
+    }
+    return {"prices": prices, "storage_per_gb": round(storage_rate, 6)}
 
-    prices: dict[str, float] = {}
-    for name, (vcpu, mem) in _PLAN_SPECS.items():
-        eff_vcpu = _EFFECTIVE_VCPU.get(name, float(vcpu))
-        prices[name] = round((eff_vcpu * cpu_rate + mem * ram_rate) * 730, 2)
-    return prices
 
-
-def _build_plans(prices: dict[str, float]) -> list[DatabasePlan]:
+def _build_plans(data: dict, source: str) -> list[DatabasePlan]:
+    prices = data.get("prices", {})
+    storage = float(data.get("storage_per_gb", 0))
+    if not prices or storage <= 0:
+        raise ValueError(
+            "cached GCP Cloud SQL pricing is incomplete; clear the pricing cache and retry"
+        )
     return [
         DatabasePlan(
             name,
             vcpu,
-            mem,
-            prices.get(name, _FALLBACK_PRICES[name]),
-            _STORAGE_PER_GB,
-            _INCLUDED_STORAGE_GB,
+            memory,
+            prices[name],
+            storage,
+            0.0,
             _notes(name),
+            source,
+            _SOURCE_URL,
         )
-        for name, (vcpu, mem) in _PLAN_SPECS.items()
+        for name, (vcpu, memory) in _PLAN_SPECS.items()
+        if name in prices
     ]

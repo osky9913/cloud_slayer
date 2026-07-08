@@ -10,7 +10,8 @@ from pathlib import Path
 
 import requests
 
-from ....config import get_aws_region
+from ....config import fallback_prices_enabled, force_live_prices_enabled, get_aws_region
+from ....pricing import PricingUnavailableError
 from ..base import DatabasePlan, DatabaseProvider
 
 CACHE_DIR = Path.home() / ".cloudslayer" / "cache"
@@ -60,7 +61,7 @@ _PLAN_SPECS: dict[str, tuple[int, float]] = {
 }
 
 _STORAGE_PER_GB = 0.115  # gp3 storage, us-east-1 — stable
-_INCLUDED_STORAGE_GB = 20.0
+_INCLUDED_STORAGE_GB = 0.0
 
 # Fallback instance prices (us-east-1, PostgreSQL, Single-AZ) — verified 2026-07
 _FALLBACK_PRICES: dict[str, float] = {
@@ -122,7 +123,15 @@ def _notes(name: str) -> str:
 
 _PLANS = [
     DatabasePlan(
-        name, vcpu, mem, _FALLBACK_PRICES[name], _STORAGE_PER_GB, _INCLUDED_STORAGE_GB, _notes(name)
+        name,
+        vcpu,
+        mem,
+        _FALLBACK_PRICES[name],
+        _STORAGE_PER_GB,
+        _INCLUDED_STORAGE_GB,
+        _notes(name),
+        "fallback",
+        "https://aws.amazon.com/rds/postgresql/pricing/",
     )
     for name, (vcpu, mem) in _PLAN_SPECS.items()
 ]
@@ -140,21 +149,36 @@ class AWSRDSProvider(DatabaseProvider):
     def plans(self) -> list[DatabasePlan]:
         try:
             return self._live_plans()
-        except Exception:
-            return _PLANS
+        except Exception as error:
+            if fallback_prices_enabled():
+                return _PLANS
+            raise PricingUnavailableError(
+                self.display_name,
+                f"live pricing unavailable ({error}); rerun with --fallback to use verified static AWS prices",
+            ) from error
 
     def _live_plans(self) -> list[DatabasePlan]:
         region = get_aws_region()
         cache_file = CACHE_DIR / f"aws_rds_prices_{region}.json"
-        if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < CACHE_TTL:
+        if (
+            not force_live_prices_enabled()
+            and cache_file.exists()
+            and (time.time() - cache_file.stat().st_mtime) < CACHE_TTL
+        ):
             with open(cache_file) as f:
-                return _build_plans(json.load(f))
+                cached = json.load(f)
+            if "storage_per_gb" in cached:
+                return _build_plans(cached, "cache")
         try:
             return self._fetch_and_cache(cache_file)
         except Exception:
-            if cache_file.exists():
+            if (
+                not force_live_prices_enabled()
+                and cache_file.exists()
+                and fallback_prices_enabled()
+            ):
                 with open(cache_file) as f:
-                    return _build_plans(json.load(f))
+                    return _build_plans(json.load(f), "stale cache")
             raise
 
     def _fetch_and_cache(self, cache_file: Path) -> list[DatabasePlan]:
@@ -174,11 +198,11 @@ class AWSRDSProvider(DatabaseProvider):
                     f.write(chunk)
             with open(tmp_path) as f:
                 data = json.load(f)
-            prices = _extract_rds_prices(data)
+            pricing = _extract_rds_prices(data)
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             with open(cache_file, "w") as f:
-                json.dump(prices, f)
-            return _build_plans(prices)
+                json.dump(pricing, f)
+            return _build_plans(pricing, "live")
         finally:
             if tmp_path:
                 try:
@@ -187,13 +211,22 @@ class AWSRDSProvider(DatabaseProvider):
                     pass
 
 
-def _extract_rds_prices(data: dict) -> dict[str, float]:
+def _extract_rds_prices(data: dict) -> dict:
     target = set(_PLAN_SPECS)
     sku_to_class: dict[str, str] = {}
+    storage_skus: list[str] = []
     for sku, product in data.get("products", {}).items():
+        attrs = product.get("attributes", {})
+        if (
+            product.get("productFamily") == "Database Storage"
+            and attrs.get("databaseEngine") == "PostgreSQL"
+            and "gp3" in attrs.get("volumeType", "").lower()
+            and attrs.get("deploymentOption") == "Single-AZ"
+        ):
+            storage_skus.append(sku)
+            continue
         if product.get("productFamily") != "Database Instance":
             continue
-        attrs = product.get("attributes", {})
         iclass = attrs.get("instanceType", "")
         if (
             iclass not in target
@@ -215,19 +248,39 @@ def _extract_rds_prices(data: dict) -> dict[str, float]:
                     if hourly > 0:
                         prices[iclass] = round(hourly * 730, 2)
                         break
-    return prices
+    storage_per_gb = 0.0
+    for sku in storage_skus:
+        for term_val in on_demand.get(sku, {}).values():
+            for dim in term_val.get("priceDimensions", {}).values():
+                if dim.get("unit") in ("GB-Mo", "GB-month"):
+                    storage_per_gb = float(dim.get("pricePerUnit", {}).get("USD", 0))
+                    if storage_per_gb > 0:
+                        break
+            if storage_per_gb > 0:
+                break
+        if storage_per_gb > 0:
+            break
+    return {"prices": prices, "storage_per_gb": storage_per_gb}
 
 
-def _build_plans(prices: dict[str, float]) -> list[DatabasePlan]:
+def _build_plans(data: dict, source: str = "live") -> list[DatabasePlan]:
+    prices = data.get("prices", data)
+    storage = float(data.get("storage_per_gb", 0))
+    if storage <= 0 and not fallback_prices_enabled():
+        raise ValueError("AWS price file did not contain PostgreSQL gp3 storage pricing")
+    storage = storage or _STORAGE_PER_GB
     return [
         DatabasePlan(
             name,
             vcpu,
             mem,
             prices.get(name, _FALLBACK_PRICES[name]),
-            _STORAGE_PER_GB,
+            storage,
             _INCLUDED_STORAGE_GB,
             _notes(name),
+            source if name in prices and data.get("storage_per_gb", 0) else "mixed fallback",
+            "https://aws.amazon.com/rds/postgresql/pricing/",
         )
         for name, (vcpu, mem) in _PLAN_SPECS.items()
+        if name in prices or fallback_prices_enabled()
     ]

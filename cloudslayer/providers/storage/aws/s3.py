@@ -6,8 +6,9 @@ from pathlib import Path
 
 import requests
 
-from ....config import get_aws_region
+from ....config import fallback_prices_enabled, force_live_prices_enabled, get_aws_region
 from ....models import StoragePricing
+from ....pricing import PricingUnavailableError
 from ..base import ObjectStorageProvider
 
 CACHE_DIR = Path.home() / ".cloudslayer" / "cache"
@@ -24,6 +25,7 @@ _FALLBACK = StoragePricing(
     notes="us-east-1, Standard — cached values (2026-07-03)",
     source_url="https://aws.amazon.com/s3/pricing/",
     last_verified="2026-07-03",
+    price_source="fallback",
 )
 
 
@@ -39,17 +41,30 @@ class AWSS3Provider(ObjectStorageProvider):
     def get_pricing(self) -> StoragePricing:
         try:
             return self._load_or_fetch()
-        except Exception:
-            return _FALLBACK
+        except Exception as error:
+            if fallback_prices_enabled():
+                return _FALLBACK
+            raise PricingUnavailableError(
+                self.display_name,
+                f"live pricing unavailable ({error}); rerun with --fallback to use verified static AWS prices",
+            ) from error
 
     def _cache_path(self) -> Path:
         region = get_aws_region()
         return CACHE_DIR / f"aws_s3_{region}.json"
 
+    def _data_transfer_cache_path(self) -> Path:
+        region = get_aws_region()
+        return CACHE_DIR / f"aws_data_transfer_{region}.json"
+
     def _load_or_fetch(self) -> StoragePricing:
         cache_file = self._cache_path()
-        if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < CACHE_TTL:
-            return self._parse_file(cache_file)
+        if (
+            not force_live_prices_enabled()
+            and cache_file.exists()
+            and (time.time() - cache_file.stat().st_mtime) < CACHE_TTL
+        ):
+            return self._parse_file(cache_file, "cache")
         return self._download_and_parse(cache_file)
 
     def _download_and_parse(self, cache_file: Path) -> StoragePricing:
@@ -64,14 +79,56 @@ class AWSS3Provider(ObjectStorageProvider):
         with open(cache_file, "wb") as f:
             for chunk in response.iter_content(chunk_size=65536):
                 f.write(chunk)
-        return self._parse_file(cache_file)
+        return self._parse_file(cache_file, "live")
 
-    def _parse_file(self, path: Path) -> StoragePricing:
+    def _parse_file(self, path: Path, source: str) -> StoragePricing:
         with open(path) as f:
             data = json.load(f)
-        return self._extract(data)
+        return self._extract(data, source, self._egress_price())
 
-    def _extract(self, data: dict) -> StoragePricing:
+    def _egress_price(self) -> float:
+        cache_file = self._data_transfer_cache_path()
+        if (
+            not force_live_prices_enabled()
+            and cache_file.exists()
+            and (time.time() - cache_file.stat().st_mtime) < CACHE_TTL
+        ):
+            with open(cache_file) as file:
+                data = json.load(file)
+        else:
+            region = get_aws_region()
+            url = (
+                "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/"
+                f"AWSDataTransfer/current/{region}/index.json"
+            )
+            response = requests.get(url, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_file, "w") as file:
+                json.dump(data, file)
+
+        region = get_aws_region()
+        products = data.get("products", {})
+        terms = data.get("terms", {}).get("OnDemand", {})
+        for sku, product in products.items():
+            attrs = product.get("attributes", {})
+            if (
+                attrs.get("fromRegionCode") != region
+                or attrs.get("toLocation") != "External"
+                or attrs.get("transferType") != "AWS Outbound"
+                or not attrs.get("usagetype", "").endswith("DataTransfer-Out-Bytes")
+            ):
+                continue
+            for term in terms.get(sku, {}).values():
+                for dimension in term.get("priceDimensions", {}).values():
+                    if dimension.get("beginRange", "0") == "0":
+                        return float(dimension.get("pricePerUnit", {}).get("USD", 0))
+        return 0.0
+
+    def _extract(
+        self, data: dict, source: str = "live", egress_override: float = 0.0
+    ) -> StoragePricing:
         products = data.get("products", {})
         on_demand = data.get("terms", {}).get("OnDemand", {})
 
@@ -126,6 +183,18 @@ class AWSS3Provider(ObjectStorageProvider):
         put_raw, put_unit = price_for(put_sku)
         get_raw, get_unit = price_for(get_sku)
         egress_price, _ = price_for(egress_sku)
+        egress_price = egress_override or egress_price
+
+        values = {
+            "storage": storage_price,
+            "get": to_per_million(get_raw, get_unit),
+            "put": to_per_million(put_raw, put_unit),
+            "egress": egress_price,
+        }
+        missing = [name for name, value in values.items() if value <= 0]
+        if missing and not fallback_prices_enabled():
+            raise ValueError(f"AWS price file did not contain: {', '.join(missing)}")
+        price_source = "mixed fallback" if missing else source
 
         return StoragePricing(
             provider="aws_s3",
@@ -138,4 +207,5 @@ class AWSS3Provider(ObjectStorageProvider):
             notes="us-east-1, Standard storage class (live pricing)",
             source_url="https://aws.amazon.com/s3/pricing/",
             last_verified="live",
+            price_source=price_source,
         )

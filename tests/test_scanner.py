@@ -1,12 +1,11 @@
 """Tests for Terraform file scanner and spec generator."""
-import json
-import textwrap
-import tempfile
-import os
-import pytest
-from pathlib import Path
 
-from cloudslayer.scanner import scan, scan_path, generate_spec, RESOURCE_MAP, AWS_INSTANCE_SPECS
+import json
+import os
+import tempfile
+import textwrap
+
+from cloudslayer.scanner import AWS_INSTANCE_SPECS, RESOURCE_MAP, generate_spec, scan, scan_path
 
 
 def _write_tf(content: str, directory: str, filename: str = "main.tf") -> str:
@@ -18,13 +17,17 @@ def _write_tf(content: str, directory: str, filename: str = "main.tf") -> str:
 
 # ── scan() ────────────────────────────────────────────────────────────────────
 
+
 def test_scan_detects_s3_bucket():
     with tempfile.TemporaryDirectory() as d:
-        _write_tf("""
+        _write_tf(
+            """
             resource "aws_s3_bucket" "uploads" {
               bucket = "my-uploads"
             }
-        """, d)
+        """,
+            d,
+        )
         resources = scan(d)
 
     assert len(resources) == 1
@@ -36,12 +39,15 @@ def test_scan_detects_s3_bucket():
 
 def test_scan_detects_aws_instance():
     with tempfile.TemporaryDirectory() as d:
-        _write_tf("""
+        _write_tf(
+            """
             resource "aws_instance" "api_server" {
               ami           = "ami-12345"
               instance_type = "t3.medium"
             }
-        """, d)
+        """,
+            d,
+        )
         resources = scan(d)
 
     assert len(resources) == 1
@@ -53,13 +59,16 @@ def test_scan_detects_aws_instance():
 
 def test_scan_detects_rds_instance():
     with tempfile.TemporaryDirectory() as d:
-        _write_tf("""
+        _write_tf(
+            """
             resource "aws_db_instance" "main_db" {
               engine         = "postgres"
               instance_class = "db.t3.medium"
               allocated_storage = 100
             }
-        """, d)
+        """,
+            d,
+        )
         resources = scan(d)
 
     assert len(resources) == 1
@@ -70,11 +79,14 @@ def test_scan_detects_rds_instance():
 
 def test_scan_ignores_unknown_resources():
     with tempfile.TemporaryDirectory() as d:
-        _write_tf("""
+        _write_tf(
+            """
             resource "aws_iam_role" "my_role" {
               name = "my-role"
             }
-        """, d)
+        """,
+            d,
+        )
         resources = scan(d)
 
     assert resources == []
@@ -82,7 +94,8 @@ def test_scan_ignores_unknown_resources():
 
 def test_scan_mixed_resources():
     with tempfile.TemporaryDirectory() as d:
-        _write_tf("""
+        _write_tf(
+            """
             resource "aws_s3_bucket" "uploads" {
               bucket = "uploads"
             }
@@ -98,7 +111,9 @@ def test_scan_mixed_resources():
             resource "aws_iam_role" "role" {
               name = "role"
             }
-        """, d)
+        """,
+            d,
+        )
         resources = scan(d)
 
     assert len(resources) == 3
@@ -108,17 +123,25 @@ def test_scan_mixed_resources():
 
 def test_scan_multiple_files():
     with tempfile.TemporaryDirectory() as d:
-        _write_tf("""
+        _write_tf(
+            """
             resource "aws_s3_bucket" "bucket_a" {
               bucket = "a"
             }
-        """, d, "storage.tf")
-        _write_tf("""
+        """,
+            d,
+            "storage.tf",
+        )
+        _write_tf(
+            """
             resource "aws_instance" "web" {
               ami           = "ami-12345"
               instance_type = "t3.medium"
             }
-        """, d, "compute.tf")
+        """,
+            d,
+            "compute.tf",
+        )
         resources = scan(d)
 
     assert len(resources) == 2
@@ -135,15 +158,20 @@ def test_scan_skips_malformed_tf():
         path = os.path.join(d, "bad.tf")
         with open(path, "w") as f:
             f.write("this is not valid hcl {{{")
-        _write_tf("""
+        _write_tf(
+            """
             resource "aws_s3_bucket" "good" { bucket = "good" }
-        """, d, "good.tf")
+        """,
+            d,
+            "good.tf",
+        )
         resources = scan(d)
 
     assert len(resources) == 1
 
 
 # ── scan_path() with terraform plan JSON ─────────────────────────────────────
+
 
 def _write_plan_json(directory: str, resources: list, child_modules: list = ()) -> str:
     plan = {
@@ -174,9 +202,12 @@ def _plan_resource(rtype: str, name: str, values: dict, index=None, mode="manage
 
 def test_plan_json_detects_instance():
     with tempfile.TemporaryDirectory() as d:
-        path = _write_plan_json(d, [
-            _plan_resource("aws_instance", "web", {"instance_type": "t3.medium"}),
-        ])
+        path = _write_plan_json(
+            d,
+            [
+                _plan_resource("aws_instance", "web", {"instance_type": "t3.medium"}),
+            ],
+        )
         report = scan_path(path)
 
     assert len(report.supported) == 1
@@ -187,15 +218,26 @@ def test_plan_json_detects_instance():
 
 def test_plan_json_walks_child_modules():
     with tempfile.TemporaryDirectory() as d:
-        path = _write_plan_json(d, [], child_modules=[{
-            "address": "module.db",
-            "resources": [
-                _plan_resource("aws_db_instance", "main", {
-                    "engine": "postgres", "instance_class": "db.t3.medium",
-                    "allocated_storage": 100,
-                }),
+        path = _write_plan_json(
+            d,
+            [],
+            child_modules=[
+                {
+                    "address": "module.db",
+                    "resources": [
+                        _plan_resource(
+                            "aws_db_instance",
+                            "main",
+                            {
+                                "engine": "postgres",
+                                "instance_class": "db.t3.medium",
+                                "allocated_storage": 100,
+                            },
+                        ),
+                    ],
+                }
             ],
-        }])
+        )
         report = scan_path(path)
 
     assert len(report.supported) == 1
@@ -204,10 +246,13 @@ def test_plan_json_walks_child_modules():
 
 def test_plan_json_expands_count_index():
     with tempfile.TemporaryDirectory() as d:
-        path = _write_plan_json(d, [
-            _plan_resource("aws_instance", "web", {"instance_type": "t3.small"}, index=0),
-            _plan_resource("aws_instance", "web", {"instance_type": "t3.small"}, index=1),
-        ])
+        path = _write_plan_json(
+            d,
+            [
+                _plan_resource("aws_instance", "web", {"instance_type": "t3.small"}, index=0),
+                _plan_resource("aws_instance", "web", {"instance_type": "t3.small"}, index=1),
+            ],
+        )
         report = scan_path(path)
 
     assert len(report.supported) == 2
@@ -216,9 +261,12 @@ def test_plan_json_expands_count_index():
 
 def test_plan_json_skips_data_sources():
     with tempfile.TemporaryDirectory() as d:
-        path = _write_plan_json(d, [
-            _plan_resource("aws_instance", "web", {"instance_type": "t3.medium"}, mode="data"),
-        ])
+        path = _write_plan_json(
+            d,
+            [
+                _plan_resource("aws_instance", "web", {"instance_type": "t3.medium"}, mode="data"),
+            ],
+        )
         report = scan_path(path)
 
     assert report.supported == []
@@ -226,10 +274,13 @@ def test_plan_json_skips_data_sources():
 
 def test_plan_json_tracks_uncosted():
     with tempfile.TemporaryDirectory() as d:
-        path = _write_plan_json(d, [
-            _plan_resource("aws_nat_gateway", "nat", {}),
-            _plan_resource("aws_iam_role", "role", {}),
-        ])
+        path = _write_plan_json(
+            d,
+            [
+                _plan_resource("aws_nat_gateway", "nat", {}),
+                _plan_resource("aws_iam_role", "role", {}),
+            ],
+        )
         report = scan_path(path)
 
     assert len(report.uncosted) == 1
@@ -240,7 +291,8 @@ def test_plan_json_tracks_uncosted():
 
 def test_scan_path_hcl_reports_uncosted():
     with tempfile.TemporaryDirectory() as d:
-        _write_tf("""
+        _write_tf(
+            """
             resource "aws_instance" "web" {
               instance_type = "t3.medium"
             }
@@ -250,7 +302,9 @@ def test_scan_path_hcl_reports_uncosted():
             resource "aws_iam_role" "role" {
               name = "role"
             }
-        """, d)
+        """,
+            d,
+        )
         report = scan_path(d)
 
     assert len(report.supported) == 1
@@ -260,11 +314,15 @@ def test_scan_path_hcl_reports_uncosted():
 
 # ── generate_spec() ───────────────────────────────────────────────────────────
 
+
 def test_generate_spec_object_storage():
     with tempfile.TemporaryDirectory() as d:
-        _write_tf("""
+        _write_tf(
+            """
             resource "aws_s3_bucket" "user_uploads" { bucket = "uploads" }
-        """, d)
+        """,
+            d,
+        )
         resources = scan(d)
 
     spec = generate_spec(resources)
@@ -275,12 +333,15 @@ def test_generate_spec_object_storage():
 
 def test_generate_spec_compute_with_instance_type():
     with tempfile.TemporaryDirectory() as d:
-        _write_tf("""
+        _write_tf(
+            """
             resource "aws_instance" "worker" {
               ami           = "ami-12345"
               instance_type = "t3.xlarge"
             }
-        """, d)
+        """,
+            d,
+        )
         resources = scan(d)
 
     spec = generate_spec(resources)
@@ -292,13 +353,16 @@ def test_generate_spec_compute_with_instance_type():
 
 def test_generate_spec_database_with_storage():
     with tempfile.TemporaryDirectory() as d:
-        _write_tf("""
+        _write_tf(
+            """
             resource "aws_db_instance" "main_db" {
               engine            = "postgres"
               instance_class    = "db.t3.medium"
               allocated_storage = 100
             }
-        """, d)
+        """,
+            d,
+        )
         resources = scan(d)
 
     spec = generate_spec(resources)
@@ -310,9 +374,12 @@ def test_generate_spec_database_with_storage():
 
 def test_generate_spec_underscore_to_hyphen():
     with tempfile.TemporaryDirectory() as d:
-        _write_tf("""
+        _write_tf(
+            """
             resource "aws_s3_bucket" "my_bucket_name" { bucket = "x" }
-        """, d)
+        """,
+            d,
+        )
         resources = scan(d)
 
     spec = generate_spec(resources)
@@ -320,6 +387,7 @@ def test_generate_spec_underscore_to_hyphen():
 
 
 # ── RESOURCE_MAP and AWS_INSTANCE_SPECS ───────────────────────────────────────
+
 
 def test_resource_map_covers_major_providers():
     assert "aws_s3_bucket" in RESOURCE_MAP

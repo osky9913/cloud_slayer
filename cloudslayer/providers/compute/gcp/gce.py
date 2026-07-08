@@ -4,7 +4,8 @@ Live pricing requires one of:
   • Application Default Credentials:  gcloud auth application-default login
   • Environment variable:             GCP_BILLING_API_KEY=AIza...
 
-Falls back to instances.vantage.sh for dedicated-vCPU types, then to hardcoded prices.
+Uses instances.vantage.sh for supported dedicated-vCPU types when the authenticated
+Cloud Billing Catalog is unavailable. It never uses hard-coded prices.
 """
 
 from __future__ import annotations
@@ -16,7 +17,8 @@ from pathlib import Path
 
 import requests
 
-from ....config import get_gcp_region
+from ....config import force_live_prices_enabled, get_gcp_region
+from ....pricing import PricingUnavailableError
 from ..base import ComputeProvider, InstanceType
 
 CACHE_DIR = Path.home() / ".cloudslayer" / "cache"
@@ -90,53 +92,6 @@ _SERIES_SKU_HINTS: dict[str, tuple[str, str]] = {
     "t2d": ("T2D AMD Instance Core", "T2D AMD Instance Ram"),
 }
 
-# Fallback prices (us-east1, Linux, on-demand) — verified 2026-07
-_FALLBACK_PRICES: dict[str, float] = {
-    # e2 shared-core
-    "e2-micro": 7.11,
-    "e2-small": 14.21,
-    "e2-medium": 24.11,
-    # e2 standard
-    "e2-standard-2": 48.92,
-    "e2-standard-4": 97.85,
-    "e2-standard-8": 195.70,
-    "e2-standard-16": 391.39,
-    "e2-standard-32": 782.78,
-    # n1 standard
-    "n1-standard-1": 24.27,
-    "n1-standard-2": 48.55,
-    "n1-standard-4": 97.09,
-    "n1-standard-8": 194.18,
-    # n1 highcpu / highmem
-    "n1-highcpu-4": 73.98,
-    "n1-highcpu-8": 147.96,
-    "n1-highmem-2": 61.67,
-    "n1-highmem-4": 123.34,
-    "n1-highmem-8": 246.68,
-    # n2 standard
-    "n2-standard-2": 73.74,
-    "n2-standard-4": 147.49,
-    "n2-standard-8": 294.97,
-    "n2-standard-16": 589.94,
-    # n2 highmem
-    "n2-highmem-2": 97.09,
-    "n2-highmem-4": 194.17,
-    "n2-highmem-8": 388.35,
-    "n2-highmem-16": 776.70,
-    # c2
-    "c2-standard-4": 139.49,
-    "c2-standard-8": 278.98,
-    "c2-standard-16": 557.95,
-    # n2d (AMD EPYC)
-    "n2d-standard-2": 66.16,
-    "n2d-standard-4": 132.32,
-    "n2d-standard-8": 264.64,
-    # t2d (AMD Tau)
-    "t2d-standard-1": 24.04,
-    "t2d-standard-2": 48.07,
-    "t2d-standard-4": 96.14,
-}
-
 
 def _notes(name: str) -> str:
     if name in ("e2-micro", "e2-small", "e2-medium"):
@@ -154,12 +109,6 @@ def _notes(name: str) -> str:
     return "Standard"
 
 
-_CATALOG = [
-    InstanceType(name, vcpu, mem, _FALLBACK_PRICES[name], _notes(name))
-    for name, (vcpu, mem) in _INSTANCE_SPECS.items()
-]
-
-
 class GCPComputeProvider(ComputeProvider):
     @property
     def name(self) -> str:
@@ -172,31 +121,39 @@ class GCPComputeProvider(ComputeProvider):
     def catalog(self) -> list[InstanceType]:
         try:
             return self._live_catalog()
-        except Exception:
-            return _CATALOG
+        except Exception as error:
+            raise PricingUnavailableError(
+                self.display_name,
+                f"live pricing unavailable ({error}); configure Application Default Credentials or GCP_BILLING_API_KEY",
+            ) from error
 
     def _live_catalog(self) -> list[InstanceType]:
         region = get_gcp_region()
         cache_file = CACHE_DIR / f"gcp_compute_prices_{region}.json"
-        if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < CACHE_TTL:
+        if (
+            not force_live_prices_enabled()
+            and cache_file.exists()
+            and (time.time() - cache_file.stat().st_mtime) < CACHE_TTL
+        ):
             with open(cache_file) as f:
-                return _build_catalog(json.load(f))
+                return _build_catalog(json.load(f), "cache")
         try:
             return self._fetch_and_cache(cache_file)
         except Exception:
-            if cache_file.exists():
-                with open(cache_file) as f:
-                    return _build_catalog(json.load(f))
             raise
 
     def _fetch_and_cache(self, cache_file: Path) -> list[InstanceType]:
-        prices = _fetch_billing_api() or _fetch_vantage()
+        prices = _fetch_billing_api()
+        source = "live"
+        if not prices:
+            prices = _fetch_vantage()
+            source = "third-party live"
         if not prices:
             raise ValueError("no GCP compute prices available from any source")
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_file, "w") as f:
-            json.dump(prices, f)
-        return _build_catalog(prices)
+            json.dump({"prices": prices, "source": source}, f)
+        return _build_catalog(prices, source)
 
 
 # ── Cloud Billing Catalog API ──────────────────────────────────────────────────
@@ -326,8 +283,8 @@ def _extract_hourly_rate(sku: dict) -> float:
 
 _VANTAGE_SKIP = {"e2-micro", "e2-small", "e2-medium"}  # shared-core: Vantage data is wrong
 
-# Types where Vantage coverage is inconsistent — use hardcoded fallback only
-_HARDCODED_ONLY = frozenset(
+# Types where Vantage coverage is inconsistent; require the Cloud Billing API.
+_VANTAGE_UNSUPPORTED = frozenset(
     name
     for name in _INSTANCE_SPECS
     if (name.startswith("n1") or name.startswith("t2d") or name.startswith("n2d"))
@@ -343,7 +300,7 @@ def _fetch_vantage() -> dict[str, float] | None:
         prices: dict[str, float] = {}
         for item in resp.json():
             name = item.get("instance_type", "")
-            if name not in _INSTANCE_SPECS or name in _VANTAGE_SKIP or name in _HARDCODED_ONLY:
+            if name not in _INSTANCE_SPECS or name in _VANTAGE_SKIP or name in _VANTAGE_UNSUPPORTED:
                 continue
             if item.get("shared_cpu"):
                 continue
@@ -356,14 +313,19 @@ def _fetch_vantage() -> dict[str, float] | None:
         return None
 
 
-def _build_catalog(prices: dict[str, float]) -> list[InstanceType]:
+def _build_catalog(data: dict, source: str = "live") -> list[InstanceType]:
+    prices = data.get("prices", data)
+    source = data.get("source", source)
     return [
         InstanceType(
             name,
             vcpu,
             mem,
-            prices.get(name, _FALLBACK_PRICES[name]),
+            prices[name],
             _notes(name),
+            source,
+            "https://cloud.google.com/compute/vm-instance-pricing",
         )
         for name, (vcpu, mem) in _INSTANCE_SPECS.items()
+        if name in prices
     ]

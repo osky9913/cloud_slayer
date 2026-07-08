@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from ...models import DatabaseResult, DatabaseSpec
+from ...pricing import PricingUnavailableError
 
 
 @dataclass
@@ -15,6 +16,8 @@ class DatabasePlan:
     storage_per_gb: float
     included_storage_gb: float = 0.0
     notes: str = ""
+    price_source: str = ""
+    source_url: str = ""
 
 
 class DatabaseProvider(ABC):
@@ -42,8 +45,17 @@ class DatabaseProvider(ABC):
             ),
         )
 
-    def calculate_cost(self, spec: DatabaseSpec) -> DatabaseResult | None:
-        match = self.find_match(spec)
+    def calculate_cost(self, spec: DatabaseSpec, plan_name: str = "") -> DatabaseResult | None:
+        match = (
+            next((plan for plan in self.plans() if plan.name == plan_name), None)
+            if plan_name
+            else self.find_match(spec)
+        )
+        if plan_name and match is None:
+            raise PricingUnavailableError(
+                self.display_name,
+                f"no price was returned for exact plan {plan_name!r}",
+            )
         if not match:
             return None
         extra_storage = max(0.0, spec.storage_gb - match.included_storage_gb)
@@ -57,4 +69,6 @@ class DatabaseProvider(ABC):
             instance_cost=match.base_price,
             storage_cost=storage_cost,
             notes=match.notes,
+            price_source=match.price_source,
+            source_url=match.source_url,
         )

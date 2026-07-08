@@ -36,4 +36,6 @@ class ObjectStorageProvider(ABC):
             request_cost=get_cost + put_cost,
             egress_cost=egress_cost,
             notes=pricing.notes,
+            price_source=pricing.price_source,
+            source_url=pricing.source_url,
         )

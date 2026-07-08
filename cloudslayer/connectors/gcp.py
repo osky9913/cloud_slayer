@@ -11,9 +11,6 @@ from dataclasses import dataclass
 
 from ..models import ComputeSpec, DatabaseSpec, ObjectStorageSpec
 
-_HOURS_PER_MONTH = 730.0
-_STORAGE_PER_GB_MONTH = 0.17  # GCP SSD persistent disk, us-east1
-
 
 @dataclass
 class GCPActualResource:
@@ -106,7 +103,7 @@ class GCPConnector:
 
     def _gce(self) -> list[GCPActualResource]:
         try:
-            from ..providers.compute.gcp_gce import _CATALOG
+            from ..providers.compute.gcp.gce import GCPComputeProvider
             from ..scanner import GCP_INSTANCE_SPECS
 
             client = self._compute_v1.InstancesClient()
@@ -122,12 +119,13 @@ class GCPConnector:
                     counts[machine_type] = counts.get(machine_type, 0) + 1
 
             # Build a fast lookup: name → monthly price
-            price_map: dict[str, float] = {it.name: it.price_per_month for it in _CATALOG}
+            price_map = {item.name: item.price_per_month for item in GCPComputeProvider().catalog()}
 
             results: list[GCPActualResource] = []
             for machine_type, count in counts.items():
-                hourly = price_map.get(machine_type, 0.0) / _HOURS_PER_MONTH
-                monthly = hourly * _HOURS_PER_MONTH * count
+                if machine_type not in price_map:
+                    continue
+                monthly = price_map[machine_type] * count
 
                 vcpu, mem = GCP_INSTANCE_SPECS.get(machine_type, (2, 4.0))
                 slug = machine_type.replace(".", "-")
@@ -170,10 +168,10 @@ class GCPConnector:
             response.raise_for_status()
             data = response.json()
 
-            from ..providers.database.gcp_cloudsql import _PLANS
+            from ..providers.database.gcp.cloudsql import GCPCloudSQLProvider
 
             # Build lookup: tier name → plan
-            plan_map: dict[str, object] = {p.name: p for p in _PLANS}
+            plan_map = {plan.name: plan for plan in GCPCloudSQLProvider().plans()}
 
             results: list[GCPActualResource] = []
             for item in data.get("items", []):
@@ -183,20 +181,16 @@ class GCPConnector:
                 tier = item.get("settings", {}).get("tier", "")
                 instance_name = item.get("name", tier)
 
-                # Resolve cost from catalog; fall back to 0 for unknown tiers
                 plan = plan_map.get(tier)
-                if plan is not None:
-                    storage_gb = float(
-                        item.get("settings", {}).get("dataDiskSizeGb", plan.included_storage_gb)
-                    )
-                    extra_storage = max(0.0, storage_gb - plan.included_storage_gb)
-                    monthly = plan.base_price + extra_storage * plan.storage_per_gb
-                    vcpu = plan.vcpu
-                    mem = plan.memory_gb
-                else:
-                    storage_gb = float(item.get("settings", {}).get("dataDiskSizeGb", 10))
-                    monthly = storage_gb * _STORAGE_PER_GB_MONTH
-                    vcpu, mem = 1, 1.75
+                if plan is None:
+                    continue
+                storage_gb = float(
+                    item.get("settings", {}).get("dataDiskSizeGb", plan.included_storage_gb)
+                )
+                extra_storage = max(0.0, storage_gb - plan.included_storage_gb)
+                monthly = plan.base_price + extra_storage * plan.storage_per_gb
+                vcpu = plan.vcpu
+                mem = plan.memory_gb
 
                 slug = instance_name.replace("_", "-").replace(":", "-")
 

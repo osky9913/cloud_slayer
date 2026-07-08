@@ -1,18 +1,21 @@
 """Tests for the strategy engine."""
+
 from __future__ import annotations
 
 import pytest
 
-from cloudslayer.models import ComputeSpec, ObjectStorageSpec, DatabaseSpec
+from cloudslayer.models import ComputeSpec, DatabaseSpec, ObjectStorageSpec
 from cloudslayer.strategies import (
-    AnalysisResource,
-    Strategy,
-    run_all_strategies,
-    _strategy_region_shift,
-    _strategy_graviton,
-    _strategy_aws_reserved as _strategy_reserved,
-    _strategy_aws_spot as _strategy_spot,
     _AWS_RI_DISCOUNTS,
+    AnalysisResource,
+    _strategy_graviton,
+    run_all_strategies,
+)
+from cloudslayer.strategies import (
+    _strategy_aws_reserved as _strategy_reserved,
+)
+from cloudslayer.strategies import (
+    _strategy_aws_spot as _strategy_spot,
 )
 
 _RI_DISCOUNT_1YR = _AWS_RI_DISCOUNTS[1]
@@ -20,6 +23,7 @@ _RI_DISCOUNT_3YR = _AWS_RI_DISCOUNTS[3]
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
+
 
 def _compute(name="web", itype="t3.medium", cost=30.37, provider="aws_ec2"):
     return AnalysisResource(
@@ -53,63 +57,43 @@ def _database(name="db", itype="db.t3.medium", cost=49.64, provider="aws_rds"):
     )
 
 
-# ── Region shift ──────────────────────────────────────────────────────────────
-
-class TestRegionShift:
-    def test_saves_on_aws_resources(self):
-        s = _strategy_region_shift([_compute(cost=100.0), _database(cost=50.0)])
-        assert s is not None
-        assert s.savings_mo > 0
-        assert s.effort == "Low"
-        assert s.risk == "Low"
-
-    def test_skips_non_aws(self):
-        r = _compute(provider="gcp_gce")
-        assert _strategy_region_shift([r]) is None
-
-    def test_one_item_per_resource(self):
-        s = _strategy_region_shift([_compute(cost=100.0), _database(cost=50.0)])
-        assert len(s.items) == 2
-
-    def test_to_cost_is_lower(self):
-        s = _strategy_region_shift([_compute(cost=100.0)])
-        assert all(item.to_cost < item.from_cost for item in s.items)
-
-    def test_trivial_savings_returns_none(self):
-        # Very small cost → savings < $2 threshold
-        s = _strategy_region_shift([_compute(cost=1.0)])
-        assert s is None
-
-
 # ── Graviton ──────────────────────────────────────────────────────────────────
+
 
 class TestGraviton:
     def test_ec2_t3_mapped_to_t4g(self):
         s = _strategy_graviton([_compute(itype="t3.medium", cost=30.37)])
         assert s is not None
-        assert s.savings_mo == pytest.approx(30.37 * 0.20, abs=0.01)
+        assert s.items[0].to_cost == pytest.approx(24.53, abs=0.01)
+        assert s.savings_mo == pytest.approx(30.37 - 24.53, abs=0.01)
         assert "t4g.medium" in s.items[0].to_label
 
     def test_rds_arm_mapped(self):
         s = _strategy_graviton([_database(itype="db.t3.medium", cost=49.64)])
         assert s is not None
-        assert s.savings_mo == pytest.approx(49.64 * 0.20, abs=0.01)
+        assert s.items[0].to_cost == pytest.approx(42.22 + 20 * 0.115, abs=0.01)
+        assert s.savings_mo == pytest.approx(49.64 - (42.22 + 20 * 0.115), abs=0.01)
         assert "db.t4g.medium" in s.items[0].to_label
 
     def test_unmapped_type_returns_none(self):
         assert _strategy_graviton([_compute(itype="m7i.large", cost=100.0)]) is None
 
     def test_both_ec2_and_rds_summed(self):
-        s = _strategy_graviton([
-            _compute(itype="t3.medium", cost=30.0),
-            _database(itype="db.t3.medium", cost=50.0),
-        ])
+        s = _strategy_graviton(
+            [
+                _compute(itype="t3.medium", cost=30.0),
+                _database(itype="db.t3.medium", cost=50.0),
+            ]
+        )
         assert s is not None
         assert len(s.items) == 2
-        assert s.savings_mo == pytest.approx(30.0 * 0.20 + 50.0 * 0.20, abs=0.01)
+        assert s.savings_mo == pytest.approx(
+            (30.0 - 24.53) + (50.0 - (42.22 + 20 * 0.115)), abs=0.01
+        )
 
 
 # ── Reserved instances ────────────────────────────────────────────────────────
+
 
 class TestReserved:
     def test_1yr_saves_30pct(self):
@@ -137,6 +121,7 @@ class TestReserved:
 
 # ── Spot ──────────────────────────────────────────────────────────────────────
 
+
 class TestSpot:
     def test_t3_family_discounted(self):
         s = _strategy_spot([_compute(itype="t3.medium", cost=30.37)])
@@ -158,6 +143,7 @@ class TestSpot:
 
 
 # ── run_all_strategies ────────────────────────────────────────────────────────
+
 
 class TestRunAllStrategies:
     def test_returns_list(self):

@@ -8,7 +8,8 @@ from pathlib import Path
 
 import requests
 
-from ....config import get_azure_region
+from ....config import fallback_prices_enabled, force_live_prices_enabled, get_azure_region
+from ....pricing import PricingUnavailableError
 from ..base import DatabasePlan, DatabaseProvider
 
 CACHE_DIR = Path.home() / ".cloudslayer" / "cache"
@@ -61,7 +62,17 @@ def _notes(name: str) -> str:
 
 
 _PLANS = [
-    DatabasePlan(name, vcpu, mem, _FALLBACK_PRICES[name], _STORAGE_PER_GB, 0.0, _notes(name))
+    DatabasePlan(
+        name,
+        vcpu,
+        mem,
+        _FALLBACK_PRICES[name],
+        _STORAGE_PER_GB,
+        0.0,
+        _notes(name),
+        "fallback",
+        "https://azure.microsoft.com/pricing/details/postgresql/flexible-server/",
+    )
     for name, (vcpu, mem) in _PLAN_SPECS.items()
 ]
 
@@ -78,15 +89,24 @@ class AzurePostgresProvider(DatabaseProvider):
     def plans(self) -> list[DatabasePlan]:
         try:
             return self._live_plans()
-        except Exception:
-            return _PLANS
+        except Exception as error:
+            if fallback_prices_enabled():
+                return _PLANS
+            raise PricingUnavailableError(
+                self.display_name,
+                f"live pricing unavailable ({error}); rerun with --fallback to use verified static Azure prices",
+            ) from error
 
     def _live_plans(self) -> list[DatabasePlan]:
         region = get_azure_region()
         cache_file = CACHE_DIR / f"azure_postgres_{region}.json"
-        if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < CACHE_TTL:
+        if (
+            not force_live_prices_enabled()
+            and cache_file.exists()
+            and (time.time() - cache_file.stat().st_mtime) < CACHE_TTL
+        ):
             with open(cache_file) as f:
-                return _build_plans(json.load(f))
+                return _build_plans(json.load(f), "cache")
         return self._fetch_and_cache(cache_file)
 
     def _fetch_and_cache(self, cache_file: Path) -> list[DatabasePlan]:
@@ -110,12 +130,18 @@ class AzurePostgresProvider(DatabaseProvider):
             params = None
         with open(cache_file, "w") as f:
             json.dump(items, f)
-        return _build_plans(items)
+        return _build_plans(items, "live")
 
 
-def _build_plans(items: list) -> list[DatabasePlan]:
+def _build_plans(items: list, source: str = "live") -> list[DatabasePlan]:
     sku_price: dict[str, float] = {}
+    storage_price = 0.0
     for item in items:
+        meter = item.get("meterName", "").lower()
+        unit = item.get("unitOfMeasure", "").lower()
+        if "storage" in meter and "gb/month" in unit and not storage_price:
+            storage_price = float(item.get("retailPrice", 0))
+            continue
         sku = item.get("armSkuName", "")
         if not sku or sku not in _PLAN_SPECS:
             continue
@@ -128,16 +154,27 @@ def _build_plans(items: list) -> list[DatabasePlan]:
         if hourly > 0 and sku not in sku_price:
             sku_price[sku] = round(hourly * 730, 2)
 
+    storage_is_live = storage_price > 0
+    if not storage_is_live and not fallback_prices_enabled():
+        raise ValueError("Azure Retail Prices API did not contain PostgreSQL storage pricing")
+    storage_price = storage_price or _STORAGE_PER_GB
     plans = [
         DatabasePlan(
             name,
             vcpu,
             mem,
             sku_price.get(name, _FALLBACK_PRICES[name]),
-            _STORAGE_PER_GB,
+            storage_price,
             0.0,
             _notes(name),
+            source if name in sku_price and storage_is_live else "mixed fallback",
+            "https://azure.microsoft.com/pricing/details/postgresql/flexible-server/",
         )
         for name, (vcpu, mem) in _PLAN_SPECS.items()
+        if name in sku_price or fallback_prices_enabled()
     ]
-    return plans if plans else _PLANS
+    if plans:
+        return plans
+    if fallback_prices_enabled():
+        return _PLANS
+    raise ValueError("Azure Retail Prices API returned no supported PostgreSQL plans")

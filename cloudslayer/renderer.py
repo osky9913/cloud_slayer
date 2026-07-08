@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from rich import box
-from rich.console import Console
 from rich.rule import Rule
 from rich.table import Table
 
+from .console import console
 from .models import (
     ComputeResult,
     ComputeSpec,
@@ -16,7 +16,9 @@ from .models import (
     ServerlessSpec,
 )
 
-console = Console()
+
+def _source_badge(source: str) -> str:
+    return f" [dim]({source})[/dim]" if source else ""
 
 
 def render_header() -> None:
@@ -101,6 +103,7 @@ def render_storage_comparison(
             if is_cheapest
             else result.display_name
         )
+        label += _source_badge(result.price_source)
         vs = (
             _vs_current_cell(result.total, current_result.total, is_current)
             if use_current
@@ -180,6 +183,7 @@ def render_compute_comparison(
             if is_cheapest
             else result.display_name
         )
+        label += _source_badge(result.price_source)
         vs = (
             _vs_current_cell(result.total, current_result.total, is_current)
             if use_current
@@ -259,6 +263,7 @@ def render_database_comparison(
             if is_cheapest
             else result.display_name
         )
+        label += _source_badge(result.price_source)
         vs = (
             _vs_current_cell(result.total, current_result.total, is_current)
             if use_current
@@ -337,6 +342,7 @@ def render_serverless_comparison(
             if is_cheapest
             else result.display_name
         )
+        label += _source_badge(result.price_source)
         vs = (
             _vs_current_cell(result.monthly_cost, current_result.monthly_cost, is_current)
             if use_current
@@ -542,7 +548,7 @@ def render_analyze(resources: list, strategies: list, source_label: str = "") ->
         ec = effort_color.get(s.effort, "white")
         rc = risk_color.get(s.risk, "white")
 
-        dominant_badge = "  [bold green]★ no trade-off[/bold green]" if s.is_dominant else ""
+        dominant_badge = "  [bold green]★ non-dominated model[/bold green]" if s.is_dominant else ""
         console.print(
             f"  [bold]Strategy {i}[/bold] · [bold cyan]{s.name}[/bold cyan]{dominant_badge}"
         )

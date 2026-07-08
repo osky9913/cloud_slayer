@@ -21,6 +21,8 @@ class AnalysisResource:
     database_spec: DatabaseSpec | None = None
     region: str = "us-east-1"
     instance_type: str = ""
+    price_source: str = ""
+    source_url: str = ""
 
 
 @dataclass
@@ -52,13 +54,6 @@ class Strategy:
 
 
 # ── Pricing constants ─────────────────────────────────────────────────────────
-
-_AWS_REGION_ALTS: list[tuple[str, str, float]] = [
-    ("eu-central-1", "Frankfurt", 0.95),
-    ("eu-west-1", "Ireland", 0.95),
-    ("eu-north-1", "Stockholm", 0.95),
-    ("ap-south-1", "Mumbai", 0.93),
-]
 
 _AWS_RI_DISCOUNTS = {1: 0.30, 3: 0.50}
 _GCP_CUD_DISCOUNTS = {1: 0.20, 3: 0.37}  # Committed Use Discounts
@@ -168,7 +163,6 @@ _AWS_SIZE_ORDER = [
 
 # Engineer-hours estimates for one-time migration cost (at $150/h blended rate)
 _MIGRATION_COSTS = {
-    "region_shift": 4 * 150,  # update Terraform region + test
     "graviton": 4 * 150,  # test arm64 builds + update launch config
     "aws_reserved": 0,  # just a purchase
     "gcp_cud": 0,
@@ -188,6 +182,40 @@ def _break_even(migration_cost: float, savings_mo: float) -> float:
     if savings_mo <= 0:
         return 0.0
     return round(migration_cost / savings_mo, 1)
+
+
+def _exact_compute_cost(resource: AnalysisResource, instance_name: str) -> float | None:
+    if resource.compute_spec is None:
+        return None
+    from .providers.compute import ALL_COMPUTE_PROVIDERS
+
+    provider = next(
+        (item for item in ALL_COMPUTE_PROVIDERS if item.name == resource.current_provider), None
+    )
+    if provider is None:
+        return None
+    try:
+        result = provider.calculate_cost(resource.compute_spec, instance_name)
+    except Exception:
+        return None
+    return result.total if result is not None else None
+
+
+def _exact_database_cost(resource: AnalysisResource, plan_name: str) -> float | None:
+    if resource.database_spec is None:
+        return None
+    from .providers.database import ALL_DATABASE_PROVIDERS
+
+    provider = next(
+        (item for item in ALL_DATABASE_PROVIDERS if item.name == resource.current_provider), None
+    )
+    if provider is None:
+        return None
+    try:
+        result = provider.calculate_cost(resource.database_spec, plan_name)
+    except Exception:
+        return None
+    return result.total if result is not None else None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -233,48 +261,6 @@ def _downsize_azure(instance_type: str) -> str | None:
 # ── Strategy generators ───────────────────────────────────────────────────────
 
 
-def _strategy_region_shift(resources: list[AnalysisResource]) -> Strategy | None:
-    from .config import get_aws_region
-
-    aws = [r for r in resources if r.current_provider.startswith("aws_")]
-    if not aws:
-        return None
-
-    current_region = get_aws_region()
-    current_total = sum(r.monthly_cost for r in aws)
-    best_region, best_city, best_mult = min(_AWS_REGION_ALTS, key=lambda x: x[2])
-    savings_total = current_total * (1 - best_mult)
-    if savings_total < 2.0:
-        return None
-
-    return Strategy(
-        id="region_shift",
-        name=f"Region shift → {best_region} ({best_city})",
-        pitch="Same provider, same services. Update the region in your Terraform provider block.",
-        savings_mo=round(savings_total, 2),
-        savings_pct=round(savings_total / current_total * 100, 1),
-        effort="Low",
-        risk="Low",
-        items=[
-            StrategyItem(
-                resource_name=r.name,
-                from_label=f"{current_region}  ${r.monthly_cost:.2f}/mo",
-                to_label=f"{best_region}  ${r.monthly_cost * best_mult:.2f}/mo",
-                from_cost=r.monthly_cost,
-                to_cost=r.monthly_cost * best_mult,
-            )
-            for r in aws
-        ],
-        caveats=[
-            "EU regions may trigger GDPR compliance requirements.",
-            "Run latency benchmarks after the move — especially for user-facing APIs.",
-        ],
-        migration_cost_est=_MIGRATION_COSTS["region_shift"],
-        break_even_months=_break_even(_MIGRATION_COSTS["region_shift"], round(savings_total, 2)),
-        priority=1,
-    )
-
-
 def _strategy_graviton(resources: list[AnalysisResource]) -> Strategy | None:
     items: list[StrategyItem] = []
     total_savings = 0.0
@@ -282,30 +268,38 @@ def _strategy_graviton(resources: list[AnalysisResource]) -> Strategy | None:
 
     for r in resources:
         if r.service == "compute" and r.instance_type in _EC2_ARM_MAP:
-            arm_type, discount = _EC2_ARM_MAP[r.instance_type]
-            saving = r.monthly_cost * discount
+            arm_type, _discount = _EC2_ARM_MAP[r.instance_type]
+            target_cost = _exact_compute_cost(r, arm_type)
+            if target_cost is None or target_cost >= r.monthly_cost:
+                continue
+            saving = r.monthly_cost - target_cost
+            discount = saving / r.monthly_cost
             items.append(
                 StrategyItem(
                     resource_name=r.name,
                     from_label=f"{r.instance_type}  ${r.monthly_cost:.2f}/mo",
-                    to_label=f"{arm_type}  ${r.monthly_cost * (1 - discount):.2f}/mo",
+                    to_label=f"{arm_type}  ${target_cost:.2f}/mo",
                     from_cost=r.monthly_cost,
-                    to_cost=r.monthly_cost * (1 - discount),
+                    to_cost=target_cost,
                     note=f"−{int(discount * 100)}% Graviton",
                 )
             )
             total_savings += saving
             total_current += r.monthly_cost
         elif r.service == "database" and r.instance_type in _RDS_ARM_MAP:
-            arm_type, discount = _RDS_ARM_MAP[r.instance_type]
-            saving = r.monthly_cost * discount
+            arm_type, _discount = _RDS_ARM_MAP[r.instance_type]
+            target_cost = _exact_database_cost(r, arm_type)
+            if target_cost is None or target_cost >= r.monthly_cost:
+                continue
+            saving = r.monthly_cost - target_cost
+            discount = saving / r.monthly_cost
             items.append(
                 StrategyItem(
                     resource_name=r.name,
                     from_label=f"{r.instance_type}  ${r.monthly_cost:.2f}/mo",
-                    to_label=f"{arm_type}  ${r.monthly_cost * (1 - discount):.2f}/mo",
+                    to_label=f"{arm_type}  ${target_cost:.2f}/mo",
                     from_cost=r.monthly_cost,
-                    to_cost=r.monthly_cost * (1 - discount),
+                    to_cost=target_cost,
                     note=f"−{int(discount * 100)}% Graviton (RDS)",
                 )
             )
@@ -630,7 +624,9 @@ def _strategy_rightsize(resources: list[AnalysisResource]) -> Strategy | None:
         if not smaller:
             continue
         # Downsizing halves vCPU and RAM → ~50% cost reduction
-        to_cost = r.monthly_cost * 0.50
+        to_cost = _exact_compute_cost(r, smaller)
+        if to_cost is None or to_cost >= r.monthly_cost:
+            continue
         saving = r.monthly_cost - to_cost
         items.append(
             StrategyItem(
@@ -943,7 +939,8 @@ def _mark_dominant(strategies: list[Strategy]) -> None:
     """Mark strategies that are not Pareto-dominated on savings / effort / risk.
 
     A strategy is dominant if no other strategy beats it on ALL three dimensions
-    simultaneously. These are the "no trade-off" moves worth highlighting first.
+    simultaneously within the model. These are candidates worth reviewing first,
+    not guarantees that a real deployment has no trade-offs.
     """
     for s in strategies:
         s.is_dominant = not any(
@@ -964,7 +961,6 @@ def run_all_strategies(resources: list[AnalysisResource]) -> list[Strategy]:
     """Run all applicable strategy generators. Result set varies by provider and instance types."""
     generators = [
         # AWS-specific
-        lambda: _strategy_region_shift(resources),
         lambda: _strategy_graviton(resources),
         lambda: _strategy_aws_spot(resources),
         lambda: _strategy_aws_reserved(resources, 1),

@@ -1,8 +1,9 @@
 """Tests for engine.py — verifies sorting, free tiers, and storage crossover."""
+
 import pytest
 
-from cloudslayer.engine import plan_object_storage, plan_compute, plan_database
-from cloudslayer.models import ObjectStorageSpec, ComputeSpec, DatabaseSpec
+from cloudslayer.engine import plan_compute, plan_database, plan_object_storage
+from cloudslayer.models import ComputeSpec, DatabaseSpec, ObjectStorageSpec
 
 
 def test_object_storage_results_sorted_ascending():
@@ -20,7 +21,9 @@ def test_object_storage_returns_all_providers():
 
 def test_object_storage_azure_cheapest_major_cloud():
     # Azure Blob Hot LRS at $0.018/GB is cheapest among the three major clouds
-    spec = ObjectStorageSpec(name="test", storage_gb=5000, get_requests=0, put_requests=0, egress_gb=0)
+    spec = ObjectStorageSpec(
+        name="test", storage_gb=5000, get_requests=0, put_requests=0, egress_gb=0
+    )
     results = plan_object_storage(spec)
     by_provider = {r.provider: r.total for r in results}
     assert by_provider["azure_blob"] < by_provider["aws_s3"]
@@ -28,7 +31,9 @@ def test_object_storage_azure_cheapest_major_cloud():
 
 
 def test_object_storage_all_three_present():
-    spec = ObjectStorageSpec(name="test", storage_gb=100, get_requests=0, put_requests=0, egress_gb=0)
+    spec = ObjectStorageSpec(
+        name="test", storage_gb=100, get_requests=0, put_requests=0, egress_gb=0
+    )
     results = plan_object_storage(spec)
     providers = {r.provider for r in results}
     assert {"aws_s3", "gcp_storage", "azure_blob"}.issubset(providers)
@@ -36,7 +41,9 @@ def test_object_storage_all_three_present():
 
 def test_object_storage_aws_egress_cost():
     # AWS egress is $0.09/GB; for 100 GB egress (no free tier), cost should be ~$9
-    spec = ObjectStorageSpec(name="test", storage_gb=0, get_requests=0, put_requests=0, egress_gb=200)
+    spec = ObjectStorageSpec(
+        name="test", storage_gb=0, get_requests=0, put_requests=0, egress_gb=200
+    )
     results = plan_object_storage(spec)
     aws = next(r for r in results if r.provider == "aws_s3")
     assert aws.egress_cost > 0

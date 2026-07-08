@@ -6,6 +6,7 @@ from pathlib import Path
 
 import typer
 
+from .console import error_console
 from .dsl import parse_hcl_full
 from .engine import plan_compute, plan_database, plan_object_storage
 from .renderer import (
@@ -26,12 +27,43 @@ app = typer.Typer(
     rich_markup_mode="rich",
 )
 
+_FALLBACK_HELP = (
+    "Allow verified static AWS/Azure prices when live or cached pricing is unavailable. "
+    "GCP never uses hard-coded prices."
+)
+_LIVE_HELP = "Force live pricing API calls and bypass local cache reads for this run."
 
-def _render_coverage(report) -> None:
-    """Honesty line: how much of the detected infrastructure is actually costed."""
-    if not report.uncosted and report.other_count == 0:
+
+def _configure_pricing(fallback: bool, live: bool) -> None:
+    from .config import set_fallback_prices, set_force_live_prices
+    from .pricing import clear_pricing_warnings
+
+    set_fallback_prices(fallback)
+    set_force_live_prices(live)
+    clear_pricing_warnings()
+
+
+def _render_pricing_warnings() -> None:
+    from .pricing import pricing_warnings
+
+    warnings = pricing_warnings()
+    if not warnings:
         return
-    parts = [f"[bold]{len(report.supported)}[/bold] costed"]
+    error_console.print("\n[yellow bold]Pricing unavailable[/yellow bold]")
+    for provider, detail in warnings:
+        error_console.print(f"  [yellow]•[/yellow] [bold]{provider}[/bold]: {detail}")
+    error_console.print()
+
+
+def _render_coverage(report, costed_count: int | None = None) -> None:
+    """Honesty line: how much of the detected infrastructure is actually costed."""
+    costed = len(report.supported) if costed_count is None else costed_count
+    unavailable = max(0, len(report.supported) - costed)
+    if not report.uncosted and report.other_count == 0 and unavailable == 0:
+        return
+    parts = [f"[bold]{costed}[/bold] costed"]
+    if unavailable:
+        parts.append(f"[yellow]{unavailable} supported but pricing unavailable[/yellow]")
     if report.uncosted:
         parts.append(f"[yellow]{len(report.uncosted)} detected but not costed yet[/yellow]")
     if report.other_count:
@@ -84,8 +116,11 @@ def plan(
     interactive: bool = typer.Option(
         False, "--interactive", "-i", help="Launch interactive split-panel TUI"
     ),
+    fallback: bool = typer.Option(False, "--fallback", help=_FALLBACK_HELP),
+    live: bool = typer.Option(False, "--live", help=_LIVE_HELP),
 ) -> None:
     """Estimate and compare costs across providers for every resource in your spec."""
+    _configure_pricing(fallback, live)
     if region:
         from .config import set_region
 
@@ -111,6 +146,8 @@ def plan(
         all_compute = [(s, _filter_results(plan_compute(s), provider)) for s in compute_specs]
         all_database = [(s, _filter_results(plan_database(s), provider)) for s in database_specs]
         all_serverless = [(s, plan_serverless(s)) for s in serverless_specs]
+    if not interactive:
+        _render_pricing_warnings()
 
     # Remove resources with no results after filtering
     all_storage = [(s, rs) for s, rs in all_storage if rs]
@@ -119,6 +156,8 @@ def plan(
     all_serverless = [(s, rs) for s, rs in all_serverless if rs]
 
     if not all_storage and not all_compute and not all_database and not all_serverless:
+        if interactive:
+            _render_pricing_warnings()
         console.print(
             f"[yellow]No results after filtering for provider=[bold]{provider}[/bold][/yellow]"
         )
@@ -135,6 +174,7 @@ def plan(
         return
 
     if interactive:
+        from .pricing import pricing_warnings
         from .tui import PlanTUI
 
         cheapest_total = (
@@ -149,6 +189,7 @@ def plan(
             all_database,
             all_serverless,
             title=f"cloudslayer plan  ·  {file.name}  ·  ${cheapest_total:,.2f}/mo cheapest",
+            pricing_warnings=pricing_warnings(),
         ).run()
         _check_budget(all_storage, all_compute, all_database, fail_if_over, all_serverless)
         return
@@ -212,6 +253,8 @@ def _output_json(
                         "egress_cost": round(r.egress_cost, 4),
                         "total": round(r.total, 4),
                         "annual": round(r.total * 12, 2),
+                        "price_source": r.price_source,
+                        "source_url": r.source_url,
                     }
                     for r in results
                 ],
@@ -232,6 +275,8 @@ def _output_json(
                         "instance_memory_gb": r.instance_memory_gb,
                         "total": round(r.price_per_month, 2),
                         "annual": round(r.price_per_month * 12, 2),
+                        "price_source": r.price_source,
+                        "source_url": r.source_url,
                     }
                     for r in results
                 ],
@@ -254,6 +299,8 @@ def _output_json(
                         "storage_cost": round(r.storage_cost, 2),
                         "total": round(r.total, 2),
                         "annual": round(r.total * 12, 2),
+                        "price_source": r.price_source,
+                        "source_url": r.source_url,
                     }
                     for r in results
                 ],
@@ -276,6 +323,8 @@ def _output_json(
                         "monthly_cost": round(r.monthly_cost, 4),
                         "per_million_requests": round(r.per_million_requests, 4),
                         "notes": r.notes,
+                        "price_source": r.price_source,
+                        "source_url": r.source_url,
                     }
                     for r in results
                 ],
@@ -301,12 +350,13 @@ def _output_markdown(
     for spec, results in all_compute:
         lines.append(f'### `compute "{spec.name}"` — {spec.vcpu} vCPU · {spec.memory_gb:g} GB RAM')
         lines.append("")
-        lines.append("| Provider | Instance | Monthly | Annual |")
-        lines.append("|---|---|--:|--:|")
+        lines.append("| Provider | Instance | Monthly | Annual | Source |")
+        lines.append("|---|---|--:|--:|---|")
         for i, r in enumerate(cap(results)):
             star = "⭐ " if i == 0 else ""
             lines.append(
-                f"| {star}{r.display_name} | `{r.instance_name}` | ${r.total:,.2f} | ${r.total * 12:,.2f} |"
+                f"| {star}{r.display_name} | `{r.instance_name}` | ${r.total:,.2f} | "
+                f"${r.total * 12:,.2f} | {r.price_source} |"
             )
         lines.append("")
 
@@ -315,12 +365,13 @@ def _output_markdown(
             f'### `database "{spec.name}"` — {spec.vcpu} vCPU · {spec.memory_gb:g} GB · {spec.storage_gb:g} GB storage'
         )
         lines.append("")
-        lines.append("| Provider | Plan | Monthly | Annual |")
-        lines.append("|---|---|--:|--:|")
+        lines.append("| Provider | Plan | Monthly | Annual | Source |")
+        lines.append("|---|---|--:|--:|---|")
         for i, r in enumerate(cap(results)):
             star = "⭐ " if i == 0 else ""
             lines.append(
-                f"| {star}{r.display_name} | `{r.plan_name}` | ${r.total:,.2f} | ${r.total * 12:,.2f} |"
+                f"| {star}{r.display_name} | `{r.plan_name}` | ${r.total:,.2f} | "
+                f"${r.total * 12:,.2f} | {r.price_source} |"
             )
         lines.append("")
 
@@ -329,13 +380,13 @@ def _output_markdown(
             f'### `object_storage "{spec.name}"` — {spec.storage_gb:g} GB · {spec.egress_gb:g} GB egress'
         )
         lines.append("")
-        lines.append("| Provider | Storage | Egress | Monthly | Annual |")
-        lines.append("|---|--:|--:|--:|--:|")
+        lines.append("| Provider | Storage | Egress | Monthly | Annual | Source |")
+        lines.append("|---|--:|--:|--:|--:|---|")
         for i, r in enumerate(cap(results)):
             star = "⭐ " if i == 0 else ""
             lines.append(
                 f"| {star}{r.display_name} | ${r.storage_cost:,.2f} | ${r.egress_cost:,.2f}"
-                f" | ${r.total:,.2f} | ${r.total * 12:,.2f} |"
+                f" | ${r.total:,.2f} | ${r.total * 12:,.2f} | {r.price_source} |"
             )
         lines.append("")
 
@@ -344,12 +395,13 @@ def _output_markdown(
             f'### `serverless "{spec.name}"` — {spec.invocations_per_month:,} invocations · {spec.memory_mb} MB'
         )
         lines.append("")
-        lines.append("| Provider | Monthly | Per 1M requests |")
-        lines.append("|---|--:|--:|")
+        lines.append("| Provider | Monthly | Per 1M requests | Source |")
+        lines.append("|---|--:|--:|---|")
         for i, r in enumerate(cap(results)):
             star = "⭐ " if i == 0 else ""
             lines.append(
-                f"| {star}{r.display_name} | ${r.monthly_cost:,.4f} | ${r.per_million_requests:,.4f} |"
+                f"| {star}{r.display_name} | ${r.monthly_cost:,.4f} | "
+                f"${r.per_million_requests:,.4f} | {r.price_source} |"
             )
         lines.append("")
 
@@ -386,6 +438,8 @@ def compare(
     interactive: bool = typer.Option(
         False, "--interactive", "-i", help="Launch interactive split-panel TUI"
     ),
+    fallback: bool = typer.Option(False, "--fallback", help=_FALLBACK_HELP),
+    live: bool = typer.Option(False, "--live", help=_LIVE_HELP),
 ) -> None:
     """Compare what you're paying NOW vs every alternative provider.
 
@@ -397,6 +451,7 @@ def compare(
       cloudslayer compare ./terraform/
       cloudslayer compare . --top 5
     """
+    _configure_pricing(fallback, live)
     if region:
         from .config import set_region
 
@@ -433,19 +488,31 @@ def compare(
             for spec, cur in storage_triples
         ]
         all_compute = [
-            (spec, _filter_results(plan_compute(spec), provider), cur, label)
+            (spec, _filter_results(plan_compute(spec, cur, label), provider), cur, label)
             for spec, cur, label in compute_triples
         ]
         all_database = [
-            (spec, _filter_results(plan_database(spec), provider), cur, label)
+            (spec, _filter_results(plan_database(spec, cur, label), provider), cur, label)
             for spec, cur, label in database_triples
         ]
         all_serverless_compare = [
             (spec, plan_serverless(spec), cur) for spec, cur in serverless_triples
         ]
+    if not interactive:
+        _render_pricing_warnings()
 
     if interactive:
+        from .pricing import pricing_warnings
         from .tui import PlanTUI
+
+        all_storage = [item for item in all_storage if item[1]]
+        all_compute = [item for item in all_compute if item[1]]
+        all_database = [item for item in all_database if item[1]]
+        all_serverless_compare = [item for item in all_serverless_compare if item[1]]
+        if not any((all_storage, all_compute, all_database, all_serverless_compare)):
+            _render_pricing_warnings()
+            console.print("[red]No priced resources are available for the interactive view.[/red]")
+            raise typer.Exit(1)
 
         PlanTUI(
             all_storage,
@@ -453,6 +520,7 @@ def compare(
             all_database,
             all_serverless_compare,
             title=f"cloudslayer compare  ·  {directory}",
+            pricing_warnings=pricing_warnings(),
         ).run()
         return
 
@@ -464,7 +532,20 @@ def compare(
         )
     )
     console.print()
-    _render_coverage(report)
+    current_costed = (
+        sum(any(result.provider == cur for result in results) for _, results, cur in all_storage)
+        + sum(
+            any(result.provider == cur for result in results) for _, results, cur, _ in all_compute
+        )
+        + sum(
+            any(result.provider == cur for result in results) for _, results, cur, _ in all_database
+        )
+        + sum(
+            any(result.provider == cur for result in results)
+            for _, results, cur in all_serverless_compare
+        )
+    )
+    _render_coverage(report, current_costed)
 
     current_spend = 0.0
     cheapest_spend = 0.0
@@ -541,6 +622,8 @@ def diff(
         "-r",
         help="Cloud region (e.g. us-east-1, eu-west-1, ap-southeast-1). Default: us-east-1",
     ),
+    fallback: bool = typer.Option(False, "--fallback", help=_FALLBACK_HELP),
+    live: bool = typer.Option(False, "--live", help=_LIVE_HELP),
 ) -> None:
     """Show the cost delta between two infrastructure specs.
 
@@ -550,6 +633,7 @@ def diff(
     Example:
       cloudslayer diff infra-before.hcl infra-after.hcl
     """
+    _configure_pricing(fallback, live)
     if region:
         from .config import set_region
 
@@ -571,6 +655,7 @@ def diff(
         after_storage = [(s, _filter_results(plan_object_storage(s), provider)) for s in a_storage]
         after_compute = [(s, _filter_results(plan_compute(s), provider)) for s in a_compute]
         after_database = [(s, _filter_results(plan_database(s), provider)) for s in a_database]
+    _render_pricing_warnings()
 
     render_diff(
         before_storage,
@@ -660,6 +745,8 @@ def analyze(
     interactive: bool = typer.Option(
         False, "--interactive", "-i", help="Launch interactive split-panel TUI"
     ),
+    fallback: bool = typer.Option(False, "--fallback", help=_FALLBACK_HELP),
+    live: bool = typer.Option(False, "--live", help=_LIVE_HELP),
 ) -> None:
     """Surface every cost-saving strategy for your infrastructure.
 
@@ -675,6 +762,7 @@ def analyze(
       cloudslayer analyze --cloud azure --days 7
       cloudslayer analyze --cloud aws --days 7 --profile prod
     """
+    _configure_pricing(fallback, live)
     if region:
         from .config import set_region
 
@@ -693,6 +781,7 @@ def analyze(
             resources = load_from_cloud(connector, days)
 
         if not resources:
+            _render_pricing_warnings()
             console.print(
                 "[yellow]No resources found. Check credentials and project/subscription.[/yellow]"
             )
@@ -704,23 +793,37 @@ def analyze(
             resources, scan_report = load_from_terraform_detailed(path)
 
         if not resources:
-            console.print(f"[yellow]No recognized cloud resources found in {path}[/yellow]")
+            _render_pricing_warnings()
+            if scan_report and scan_report.supported:
+                console.print(
+                    "[yellow]Resources were recognized, but their current pricing is unavailable.[/yellow]"
+                )
+            else:
+                console.print(f"[yellow]No recognized cloud resources found in {path}[/yellow]")
             raise typer.Exit(1)
 
         source_label = path
 
     with console.status("[bold cyan]Computing strategies...[/bold cyan]", spinner="dots"):
         strategies = run_all_strategies(resources)
+    if not interactive:
+        _render_pricing_warnings()
 
     if interactive:
+        from .pricing import pricing_warnings
         from .tui import AnalyzeTUI
 
-        AnalyzeTUI(resources, strategies, source_label=source_label).run()
+        AnalyzeTUI(
+            resources,
+            strategies,
+            source_label=source_label,
+            pricing_warnings=pricing_warnings(),
+        ).run()
         return
 
     if scan_report is not None:
         console.print()
-        _render_coverage(scan_report)
+        _render_coverage(scan_report, len(resources))
     render_analyze(resources, strategies, source_label)
 
 
@@ -886,8 +989,13 @@ jobs:
 
 
 @app.command()
-def providers() -> None:
+def providers(
+    fallback: bool = typer.Option(False, "--fallback", help=_FALLBACK_HELP),
+    live: bool = typer.Option(False, "--live", help=_LIVE_HELP),
+) -> None:
     """List all supported cloud providers, resource types, and pricing sources."""
+    _configure_pricing(fallback, live)
+    from .pricing import PricingUnavailableError
     from .providers import ALL_OBJECT_STORAGE_PROVIDERS
     from .providers.compute import ALL_COMPUTE_PROVIDERS
     from .providers.database import ALL_DATABASE_PROVIDERS
@@ -895,33 +1003,51 @@ def providers() -> None:
     console.print()
     console.print(f"[bold]Object Storage[/bold]  ({len(ALL_OBJECT_STORAGE_PROVIDERS)} providers)\n")
     for p in ALL_OBJECT_STORAGE_PROVIDERS:
-        pricing = p.get_pricing()
-        source = (
-            "[green]live[/green]"
-            if pricing.last_verified == "live"
-            else f"[dim]verified {pricing.last_verified}[/dim]"
-        )
+        try:
+            pricing = p.get_pricing()
+        except PricingUnavailableError as error:
+            console.print(
+                f"  [cyan]{p.display_name:<28}[/cyan]  [yellow]unavailable[/yellow]  [dim]{error.detail}[/dim]"
+            )
+            continue
+        source = pricing.price_source or pricing.last_verified or "unknown"
         console.print(
             f"  [cyan]{p.display_name:<28}[/cyan]"
             f"  ${pricing.storage_per_gb_mo:.4f}/GB/mo"
             f"  egress ${pricing.egress_per_gb:.4f}/GB"
-            f"  {source}"
+            f"  [dim]{source}[/dim]"
         )
 
     console.print(f"\n[bold]Compute[/bold]  ({len(ALL_COMPUTE_PROVIDERS)} providers)\n")
     for p in ALL_COMPUTE_PROVIDERS:
-        instances = p.catalog()
+        try:
+            instances = p.catalog()
+        except PricingUnavailableError as error:
+            console.print(
+                f"  [cyan]{p.display_name:<28}[/cyan]  [yellow]unavailable[/yellow]  [dim]{error.detail}[/dim]"
+            )
+            continue
         price_range = f"${min(i.price_per_month for i in instances):.2f}–${max(i.price_per_month for i in instances):.2f}/mo"
+        sources = ", ".join(sorted({item.price_source or "unknown" for item in instances}))
         console.print(
-            f"  [cyan]{p.display_name:<28}[/cyan]  {len(instances):>2} instance types  {price_range}"
+            f"  [cyan]{p.display_name:<28}[/cyan]  {len(instances):>2} instance types  "
+            f"{price_range}  [dim]{sources}[/dim]"
         )
 
     console.print(f"\n[bold]Database[/bold]  ({len(ALL_DATABASE_PROVIDERS)} providers)\n")
     for p in ALL_DATABASE_PROVIDERS:
-        db_plans = p.plans()
+        try:
+            db_plans = p.plans()
+        except PricingUnavailableError as error:
+            console.print(
+                f"  [cyan]{p.display_name:<28}[/cyan]  [yellow]unavailable[/yellow]  [dim]{error.detail}[/dim]"
+            )
+            continue
         price_range = f"${min(pl.base_price for pl in db_plans):.2f}–${max(pl.base_price for pl in db_plans):.2f}/mo"
+        sources = ", ".join(sorted({plan.price_source or "unknown" for plan in db_plans}))
         console.print(
-            f"  [cyan]{p.display_name:<28}[/cyan]  {len(db_plans):>2} plans  {price_range}"
+            f"  [cyan]{p.display_name:<28}[/cyan]  {len(db_plans):>2} plans  "
+            f"{price_range}  [dim]{sources}[/dim]"
         )
     console.print()
 
@@ -992,6 +1118,8 @@ def actual(
     provider: str = typer.Option(
         "", "--provider", "-p", help="Filter comparison providers (comma-separated)"
     ),
+    fallback: bool = typer.Option(False, "--fallback", help=_FALLBACK_HELP),
+    live: bool = typer.Option(False, "--live", help=_LIVE_HELP),
 ) -> None:
     """Show your actual cloud spend vs what you'd pay on every alternative.
 
@@ -1021,6 +1149,7 @@ def actual(
     """
     from rich.rule import Rule
 
+    _configure_pricing(fallback, live)
     cloud = cloud.lower()
     connector, source_label = _make_connector(cloud, profile, days)
 
@@ -1104,6 +1233,8 @@ def actual(
                     current_provider=resource.current_provider,
                     instance_label=resource.display_name,
                 )
+
+    _render_pricing_warnings()
 
     total_savings = current_spend - cheapest_spend
     console.print(Rule("[bold]Total Savings Opportunity[/bold]", style="cyan"))

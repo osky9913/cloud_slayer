@@ -1,19 +1,20 @@
 """Tests for individual provider pricing logic."""
+
 import pytest
 
-from cloudslayer.models import ObjectStorageSpec, ComputeSpec, DatabaseSpec
+from cloudslayer.models import ComputeSpec, DatabaseSpec, ObjectStorageSpec
 from cloudslayer.providers.compute.aws.ec2 import AWSEC2Provider
-from cloudslayer.providers.compute.gcp.gce import GCPComputeProvider
 from cloudslayer.providers.compute.azure.vm import AzureComputeProvider
+from cloudslayer.providers.compute.gcp.gce import GCPComputeProvider
 from cloudslayer.providers.database.aws.rds import AWSRDSProvider
 from cloudslayer.providers.database.azure.postgres import AzurePostgresProvider
 from cloudslayer.providers.database.gcp.cloudsql import GCPCloudSQLProvider
 from cloudslayer.providers.storage.aws.s3 import AWSS3Provider
-from cloudslayer.providers.storage.gcp.storage import GCPStorageProvider
 from cloudslayer.providers.storage.azure.blob import AzureBlobProvider
-
+from cloudslayer.providers.storage.gcp.storage import GCPStorageProvider
 
 # ── Compute: AWS EC2 ──────────────────────────────────────────────────────────
+
 
 class TestAWSEC2:
     def setup_method(self):
@@ -35,6 +36,7 @@ class TestAWSEC2:
 
 # ── Compute: GCP ──────────────────────────────────────────────────────────────
 
+
 class TestGCPCompute:
     def setup_method(self):
         self.provider = GCPComputeProvider()
@@ -50,6 +52,7 @@ class TestGCPCompute:
 
 
 # ── Compute: Azure ────────────────────────────────────────────────────────────
+
 
 class TestAzureCompute:
     def setup_method(self):
@@ -67,6 +70,7 @@ class TestAzureCompute:
 
 # ── Database: AWS RDS ─────────────────────────────────────────────────────────
 
+
 class TestAWSRDS:
     def setup_method(self):
         self.provider = AWSRDSProvider()
@@ -82,6 +86,7 @@ class TestAWSRDS:
 
 
 # ── Database: GCP Cloud SQL ───────────────────────────────────────────────────
+
 
 class TestGCPCloudSQL:
     def setup_method(self):
@@ -99,6 +104,7 @@ class TestGCPCloudSQL:
 
 # ── Database: Azure PostgreSQL ────────────────────────────────────────────────
 
+
 class TestAzurePostgres:
     def setup_method(self):
         self.provider = AzurePostgresProvider()
@@ -110,8 +116,12 @@ class TestAzurePostgres:
         assert result.total > 0
 
     def test_storage_billed_from_zero_included(self):
-        small = self.provider.calculate_cost(DatabaseSpec(name="x", vcpu=1, memory_gb=2, storage_gb=0))
-        big = self.provider.calculate_cost(DatabaseSpec(name="x", vcpu=1, memory_gb=2, storage_gb=100))
+        small = self.provider.calculate_cost(
+            DatabaseSpec(name="x", vcpu=1, memory_gb=2, storage_gb=0)
+        )
+        big = self.provider.calculate_cost(
+            DatabaseSpec(name="x", vcpu=1, memory_gb=2, storage_gb=100)
+        )
         assert big.storage_cost > small.storage_cost
 
     def test_provider_name(self):
@@ -119,6 +129,7 @@ class TestAzurePostgres:
 
 
 # ── Object Storage: AWS S3 ────────────────────────────────────────────────────
+
 
 class TestAWSS3:
     def setup_method(self):
@@ -135,6 +146,7 @@ class TestAWSS3:
 
 # ── Object Storage: GCP ───────────────────────────────────────────────────────
 
+
 class TestGCPStorage:
     def setup_method(self):
         self.provider = GCPStorageProvider()
@@ -149,6 +161,7 @@ class TestGCPStorage:
 
 
 # ── Object Storage: Azure Blob ────────────────────────────────────────────────
+
 
 class TestAzureBlob:
     def setup_method(self):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from rich import box as rbox
 from rich.console import Group
+from rich.markup import escape
 from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -52,6 +53,69 @@ def _normalize(pairs: list) -> list[tuple]:
     return out
 
 
+def _source_cell(source: str) -> str:
+    label = source or "unknown"
+    lowered = label.lower()
+    if "stale" in lowered:
+        color = "red"
+    elif "fallback" in lowered:
+        color = "yellow"
+    elif "third-party" in lowered:
+        color = "magenta"
+    elif "cache" in lowered:
+        color = "cyan"
+    elif "actual" in lowered or "live" in lowered:
+        color = "green"
+    else:
+        color = "white"
+    return f"[{color}]{escape(label)}[/{color}]"
+
+
+def _pricing_notice(
+    warnings: list[tuple[str, str]],
+    sources: set[str],
+    *,
+    modeled: bool = False,
+    comparison: bool = False,
+) -> str:
+    lines: list[str] = []
+    if comparison:
+        lines.append(
+            "[bold]Planning estimate:[/bold] alternatives satisfy declared capacity and usage; "
+            "they are not benchmark-equivalent instances or an invoice forecast."
+        )
+    if modeled:
+        lines.append(
+            "[bold yellow]Modeled estimates:[/bold yellow] strategy savings use scenario assumptions; "
+            "verify utilization, commitment terms, and workload suitability before acting."
+        )
+        if sources:
+            lines.append(
+                f"[bold]Baseline pricing sources:[/bold] {escape(', '.join(sorted(sources)))}."
+            )
+    fallback_sources = sorted(source for source in sources if "fallback" in source.lower())
+    if fallback_sources:
+        lines.append(
+            "[bold yellow]Fallback pricing is present:[/bold yellow] "
+            f"{escape(', '.join(fallback_sources))}. Check the Source column."
+        )
+    stale_sources = sorted(source for source in sources if "stale" in source.lower())
+    if stale_sources:
+        lines.append(
+            "[bold red]Expired cache data is present:[/bold red] "
+            f"{escape(', '.join(stale_sources))}. Refresh before making decisions."
+        )
+    third_party = sorted(source for source in sources if "third-party" in source.lower())
+    if third_party:
+        lines.append(
+            "[bold magenta]Third-party live pricing is present:[/bold magenta] "
+            f"{escape(', '.join(third_party))}."
+        )
+    for provider, detail in warnings:
+        lines.append(f"[bold red]{escape(provider)} omitted:[/bold red] {escape(detail)}")
+    return "\n".join(lines)
+
+
 def _vs_cell(
     result_total: float,
     cheapest_total: float,
@@ -98,6 +162,14 @@ class AnalyzeTUI(_ThemeMixin, App[None]):
         background: $boost;
         border-bottom: solid $primary;
     }
+    #pricing-warning {
+        height: auto;
+        max-height: 7;
+        padding: 0 2;
+        background: $warning 12%;
+        border-bottom: solid $warning;
+        overflow: auto scroll;
+    }
     #body { layout: horizontal; height: 1fr; }
     #nav {
         width: 42;
@@ -134,11 +206,24 @@ class AnalyzeTUI(_ThemeMixin, App[None]):
         3: "↗ Major migrations",
     }
 
-    def __init__(self, resources: list, strategies: list, source_label: str = "") -> None:
+    def __init__(
+        self,
+        resources: list,
+        strategies: list,
+        source_label: str = "",
+        pricing_warnings: list[tuple[str, str]] | None = None,
+    ) -> None:
         super().__init__()
         self._resources = resources
         self._strategies = strategies
         self._source_label = source_label
+        self._pricing_warnings = pricing_warnings or []
+        self._price_sources = {
+            f"{r.current_provider}: {r.price_source}"
+            + (f" — {r.source_url}" if r.source_url else "")
+            for r in resources
+            if r.price_source
+        }
         self._current_total = sum(r.monthly_cost for r in resources)
         self._max_savings = max((s.savings_mo for s in strategies), default=0.0)
         self._idx_map: list[int | None] = []  # ListView index → strategy index (None = separator)
@@ -167,21 +252,24 @@ class AnalyzeTUI(_ThemeMixin, App[None]):
     def _summary_text(self) -> str:
         best = self._strategies[0] if self._strategies else None
         dominant = sum(1 for s in self._strategies if s.is_dominant)
-        parts = [f"[bold]${self._current_total:,.2f}/mo[/bold] current spend"]
+        parts = [f"[bold]${self._current_total:,.2f}/mo[/bold] priced baseline"]
         if best:
             top = max(self._strategies, key=lambda s: s.savings_mo)
             parts.append(
-                f"best move saves [bold green]${top.savings_mo:,.2f}/mo[/bold green] ({top.name})"
+                f"best modeled move saves [bold green]${top.savings_mo:,.2f}/mo[/bold green] ({top.name})"
             )
         parts.append(
             f"{len(self._strategies)} strategies"
-            + (f" · [green]{dominant} ★ no trade-off[/green]" if dominant else "")
+            + (f" · [green]{dominant} ★ non-dominated model[/green]" if dominant else "")
         )
         return "  ·  ".join(parts)
 
     def compose(self) -> ComposeResult:
         sidebar_items, self._idx_map = self._build_sidebar_items()
         yield Header(show_clock=False)
+        notice = _pricing_notice(self._pricing_warnings, self._price_sources, modeled=True)
+        if notice:
+            yield Static(notice, id="pricing-warning", markup=True)
         yield Static(self._summary_text(), id="summary", markup=True)
         with Horizontal(id="body"):
             yield ListView(*sidebar_items, id="nav")
@@ -195,7 +283,7 @@ class AnalyzeTUI(_ThemeMixin, App[None]):
         self.title = (
             f"cloudslayer analyze{label}"
             f"  ·  {n} resource{'s' if n != 1 else ''}"
-            f"  ·  ${self._current_total:,.2f}/mo current"
+            f"  ·  ${self._current_total:,.2f}/mo priced baseline"
         )
         nav = self.query_one("#nav", ListView)
         nav.focus()
@@ -262,7 +350,7 @@ class AnalyzeTUI(_ThemeMixin, App[None]):
         ec = _effort_color(s.effort)
         rc = _risk_color(s.risk)
         overhead = f"  [dim]+${s.overhead_mo:.2f}/mo overhead[/dim]" if s.overhead_mo > 0 else ""
-        dominant = "  [bold green]★ no trade-off[/bold green]" if s.is_dominant else ""
+        dominant = "  [bold green]★ non-dominated model[/bold green]" if s.is_dominant else ""
         be = ""
         if s.migration_cost_est > 0 and s.break_even_months > 0:
             be = f"\n[dim]Break-even: {s.break_even_months:.0f} months  (one-time migration ~${s.migration_cost_est:,.0f})[/dim]"
@@ -289,7 +377,7 @@ class AnalyzeTUI(_ThemeMixin, App[None]):
             Group(
                 Text.from_markup(
                     f"\n[bold cyan]{s.name}[/bold cyan]{dominant}\n"
-                    f"[bold green]Save ${s.savings_mo:,.2f}/mo ({s.savings_pct:.0f}%)[/bold green]"
+                    f"[bold green]Modeled saving ${s.savings_mo:,.2f}/mo ({s.savings_pct:.0f}%)[/bold green]"
                     f"    Effort [{ec}]{s.effort}[/{ec}]    Risk [{rc}]{s.risk}[/{rc}]{overhead}{be}\n\n"
                     f"[dim]{s.pitch}[/dim]\n"
                 ),
@@ -326,6 +414,14 @@ class PlanTUI(_ThemeMixin, App[None]):
         background: $boost;
         border-top: solid $primary;
     }
+    #pricing-warning {
+        height: auto;
+        max-height: 7;
+        padding: 0 2;
+        background: $warning 12%;
+        border-bottom: solid $warning;
+        overflow: auto scroll;
+    }
     ListItem { padding: 0 2; border-left: thick $panel; }
     ListItem.--highlight { background: $accent 20%; border-left: thick $accent; }
     """
@@ -345,6 +441,7 @@ class PlanTUI(_ThemeMixin, App[None]):
         all_database: list,
         all_serverless: list | None = None,
         title: str = "cloudslayer plan",
+        pricing_warnings: list[tuple[str, str]] | None = None,
     ) -> None:
         super().__init__()
         self._data: dict[str, list[tuple]] = {
@@ -354,6 +451,14 @@ class PlanTUI(_ThemeMixin, App[None]):
             "serverless": _normalize(all_serverless or []),
         }
         self._app_title = title
+        self._pricing_warnings = pricing_warnings or []
+        self._price_sources = {
+            result.price_source
+            for items in self._data.values()
+            for _, results, *_ in items
+            for result in results
+            if result.price_source
+        }
 
     def _cheapest_label(self, kind: str, spec, results) -> str:
         get_cost = (lambda r: r.monthly_cost) if kind == "serverless" else (lambda r: r.total)
@@ -384,6 +489,9 @@ class PlanTUI(_ThemeMixin, App[None]):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
+        notice = _pricing_notice(self._pricing_warnings, self._price_sources, comparison=True)
+        if notice:
+            yield Static(notice, id="pricing-warning", markup=True)
         with TabbedContent():
             for kind, label in (
                 ("storage", "Storage"),
@@ -489,6 +597,7 @@ class PlanTUI(_ThemeMixin, App[None]):
             expand=True,
         )
         tbl.add_column("Provider", min_width=24, no_wrap=True)
+        tbl.add_column("Source", min_width=12, no_wrap=True)
         tbl.add_column("Storage", justify="right", min_width=9)
         tbl.add_column("Requests", justify="right", min_width=9)
         tbl.add_column("Egress", justify="right", min_width=9)
@@ -508,6 +617,7 @@ class PlanTUI(_ThemeMixin, App[None]):
             )
             tbl.add_row(
                 lbl,
+                _source_cell(r.price_source),
                 f"${r.storage_cost:,.2f}",
                 f"${r.request_cost:,.2f}",
                 f"${r.egress_cost:,.2f}",
@@ -515,7 +625,12 @@ class PlanTUI(_ThemeMixin, App[None]):
                 _vs_cell(r.total, cheapest.total if cheapest else 0, cur_total, is_cur, use_cur),
             )
 
-        return Group(tbl, self._footer_text(sorted_r, cheapest, cur, use_cur, "display_name", None))
+        return Group(
+            tbl,
+            self._footer_text(
+                sorted_r, cheapest, cur, use_cur, "display_name", None, current_provider
+            ),
+        )
 
     def _compute_view(self, spec, results, current_provider: str, instance_label: str) -> Group:
         sorted_r = sorted(results, key=lambda r: r.total)
@@ -537,6 +652,7 @@ class PlanTUI(_ThemeMixin, App[None]):
             expand=True,
         )
         tbl.add_column("Provider", min_width=24, no_wrap=True)
+        tbl.add_column("Source", min_width=12, no_wrap=True)
         tbl.add_column("Instance", min_width=16, no_wrap=True)
         tbl.add_column("vCPU", justify="right", min_width=5)
         tbl.add_column("RAM", justify="right", min_width=7)
@@ -556,6 +672,7 @@ class PlanTUI(_ThemeMixin, App[None]):
             )
             tbl.add_row(
                 lbl,
+                _source_cell(r.price_source),
                 r.instance_name,
                 str(r.instance_vcpu),
                 f"{r.instance_memory_gb:.0f} GB",
@@ -565,7 +682,10 @@ class PlanTUI(_ThemeMixin, App[None]):
 
         extra = cheapest.instance_name if cheapest else ""
         return Group(
-            tbl, self._footer_text(sorted_r, cheapest, cur, use_cur, "display_name", extra)
+            tbl,
+            self._footer_text(
+                sorted_r, cheapest, cur, use_cur, "display_name", extra, current_provider
+            ),
         )
 
     def _database_view(self, spec, results, current_provider: str, instance_label: str) -> Group:
@@ -586,6 +706,7 @@ class PlanTUI(_ThemeMixin, App[None]):
             expand=True,
         )
         tbl.add_column("Provider", min_width=18, no_wrap=True)
+        tbl.add_column("Source", min_width=12, no_wrap=True)
         tbl.add_column("Plan", min_width=20, no_wrap=True)
         tbl.add_column("vCPU", justify="right", min_width=5)
         tbl.add_column("RAM", justify="right", min_width=8)
@@ -607,6 +728,7 @@ class PlanTUI(_ThemeMixin, App[None]):
             )
             tbl.add_row(
                 lbl,
+                _source_cell(r.price_source),
                 r.plan_name,
                 str(r.plan_vcpu),
                 f"{r.plan_memory_gb:.1f} GB",
@@ -618,7 +740,10 @@ class PlanTUI(_ThemeMixin, App[None]):
 
         extra = cheapest.plan_name if cheapest else ""
         return Group(
-            tbl, self._footer_text(sorted_r, cheapest, cur, use_cur, "display_name", extra)
+            tbl,
+            self._footer_text(
+                sorted_r, cheapest, cur, use_cur, "display_name", extra, current_provider
+            ),
         )
 
     def _serverless_view(self, spec, results, current_provider: str) -> Group:
@@ -639,6 +764,7 @@ class PlanTUI(_ThemeMixin, App[None]):
             expand=True,
         )
         tbl.add_column("Provider", min_width=24, no_wrap=True)
+        tbl.add_column("Source", min_width=12, no_wrap=True)
         tbl.add_column("Monthly", justify="right", min_width=10, style="bold")
         tbl.add_column("Per 1M Req", justify="right", min_width=12)
         tbl.add_column("Notes", min_width=28)
@@ -657,6 +783,7 @@ class PlanTUI(_ThemeMixin, App[None]):
             )
             tbl.add_row(
                 lbl,
+                _source_cell(r.price_source),
                 f"${r.monthly_cost:,.4f}",
                 f"${r.per_million_requests:,.4f}",
                 r.notes,
@@ -672,7 +799,14 @@ class PlanTUI(_ThemeMixin, App[None]):
         return Group(
             tbl,
             self._footer_text(
-                sorted_r, cheapest, cur, use_cur, "display_name", None, use_monthly=True
+                sorted_r,
+                cheapest,
+                cur,
+                use_cur,
+                "display_name",
+                None,
+                current_provider,
+                use_monthly=True,
             ),
         )
 
@@ -684,12 +818,18 @@ class PlanTUI(_ThemeMixin, App[None]):
         use_cur: bool,
         name_attr: str,
         plan_attr: str | None,
+        current_provider: str = "",
         use_monthly: bool = False,
     ) -> Text:
         if not sorted_r or not cheapest:
             return Text("")
         get_cost = (lambda r: r.monthly_cost) if use_monthly else (lambda r: r.total)
         lines = []
+        if current_provider and cur is None:
+            lines.append(
+                "[bold red]Current-provider baseline unavailable.[/bold red] "
+                "Savings versus the current deployment are intentionally not shown."
+            )
         if getattr(cheapest, "notes", ""):
             lines.append(f"[dim]★  {cheapest.notes}[/dim]")
         plan_str = (
@@ -704,10 +844,24 @@ class PlanTUI(_ThemeMixin, App[None]):
                 f"\n[bold]Switch:[/bold] [green]{name}[/green]{plan_str} saves "
                 f"[bold green]${savings:,.2f}/mo[/bold green]"
             )
-        elif len(sorted_r) > 1 and not use_cur:
+        elif len(sorted_r) > 1 and not use_cur and not current_provider:
             savings = get_cost(sorted_r[-1]) - get_cost(cheapest)
             lines.append(
                 f"\n[bold]Recommendation:[/bold] [green]{name}[/green]{plan_str} saves "
                 f"[bold]${savings:,.2f}/mo[/bold] vs most expensive"
             )
+        source_lines = sorted(
+            {
+                (
+                    result.display_name,
+                    result.price_source or "unknown",
+                    result.source_url,
+                )
+                for result in sorted_r
+            }
+        )
+        lines.append("\n[bold]Pricing sources[/bold]")
+        for provider, source, url in source_lines:
+            detail = f" — {escape(url)}" if url else ""
+            lines.append(f"  [dim]{escape(provider)}:[/dim] {_source_cell(source)}{detail}")
         return Text.from_markup("\n".join(lines)) if lines else Text("")

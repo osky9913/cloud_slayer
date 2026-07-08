@@ -1,8 +1,8 @@
 """Tests for HCL parsing — covers all three resource block types."""
-import textwrap
-import tempfile
+
 import os
-import pytest
+import tempfile
+import textwrap
 
 from cloudslayer.dsl import parse_hcl
 

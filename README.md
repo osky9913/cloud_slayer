@@ -29,11 +29,11 @@
 > _"Where should this workload run — AWS, GCP, or Azure?"_
 > _"What should I change first to cut the bill?"_
 
-It maps your infrastructure to **equivalent** resources on all three major clouds (`t3.medium` ↔ `e2-medium` ↔ `Standard_B2s`), prices them from official pricing APIs, and runs a strategy engine that surfaces cost-saving moves sorted by impact and practicality — immediate wins first, big migrations last.
+It maps your infrastructure to **equivalent** resources on all three major clouds (`t3.medium` ↔ `e2-medium` ↔ `Standard_B2s`), preserves the exact current instance for the baseline, and prices alternatives from live catalogs or fresh caches.
 
 ## How is this different from Infracost?
 
-[Infracost](https://github.com/infracost/infracost) tells you what your Terraform costs *on the cloud it's written for*. cloudslayer tells you what the equivalent setup costs *on every major cloud*, plus what to change (Graviton, spot, scheduling, reserved instances, storage tiering, region shifts). Different questions — they work great together:
+[Infracost](https://github.com/infracost/infracost) tells you what your Terraform costs *on the cloud it's written for*. cloudslayer tells you what the equivalent setup costs *on every major cloud*, plus what to change (Graviton, spot, scheduling, reserved instances, storage tiering). Different questions — they work great together:
 
 |                                | Infracost | cloudslayer |
 |--------------------------------|:---:|:---:|
@@ -44,12 +44,12 @@ It maps your infrastructure to **equivalent** resources on all three major cloud
 
 ## Features
 
-- **Cross-cloud comparison** — compute, managed PostgreSQL, object storage, and serverless functions on AWS, GCP, and Azure
+- **Cross-cloud comparison** — compute, managed PostgreSQL, and object storage on AWS, GCP, and Azure; AWS/Azure serverless tariffs are available only with `--fallback` while live serverless catalog support is completed
 - **Terraform scanner** — reads `.tf` files directly, or a `terraform show -json` plan for full module/variable/count resolution
 - **Strategy engine** — 15+ strategies (Graviton, Reserved Instances, Savings Plans, Spot, Instance Scheduler, Storage Lifecycle, …) with Pareto-dominant detection
 - **Honest coverage** — tells you exactly which detected resources are and aren't included in the estimate
-- **Live pricing** — AWS (Bulk Pricing API) and Azure (Retail Prices API) fetched live and cached 7 days; GCP verified monthly
-- **Interactive TUI** — navigate strategies and comparisons with the keyboard, powered by [Textual](https://github.com/Textualize/textual)
+- **Strict pricing provenance** — live API and cache results are labeled; unavailable providers are reported instead of silently receiving made-up prices
+- **Interactive TUI** — the primary workflow: every provider row shows its pricing source, fallback/unavailable providers stay visibly flagged, and missing current baselines never produce a savings claim
 - **CI/CD ready** — `--format markdown` for PR comments, `--fail-if-over` budget gates, cost diff between branches
 
 ## Install
@@ -168,7 +168,7 @@ cloudslayer analyze ./terraform/
 
 ──────── Immediate wins  (no commitment, quick to implement) ────────
 
-  Strategy 1 · Instance Scheduler (non-prod off-hours)  ★ no trade-off
+  Strategy 1 · Instance Scheduler (non-prod off-hours)  ★ non-dominated model
   Save $51.51/mo (70%)    Effort Low    Risk Low   break-even 12 mo
   Stop dev/staging 7PM–8AM + weekends → 70% cost cut for non-prod.
 
@@ -182,7 +182,7 @@ cloudslayer analyze ./terraform/
 
   ── Commitment purchases  (lock-in required, zero migration) ────────
 
-  Strategy 6 · AWS 3-year Compute Savings Plans  ★ no trade-off
+  Strategy 6 · AWS 3-year Compute Savings Plans  ★ non-dominated model
   Save $52.20/mo (50%)    Effort None    Risk Medium
   Like RIs but cross-family — discount survives a Graviton migration.
 
@@ -193,7 +193,7 @@ cloudslayer analyze ./terraform/
   Move each resource to its cheapest equivalent on GCP/Azure.
 ```
 
-**Dominant strategies** (★) are Pareto-non-dominated — no other strategy simultaneously beats them on savings, effort, and risk. Pick one of these and you're making no trade-off at all.
+**Non-dominated strategies** (★) are not simultaneously beaten by another modeled strategy on savings, effort, and risk. They are useful candidates to investigate, not a promise that the real deployment has no trade-offs.
 
 ## Interactive TUI
 
@@ -203,6 +203,12 @@ Add `--interactive` to any command to launch a split-panel terminal UI:
 cloudslayer analyze ./terraform/ --interactive
 cloudslayer plan infra.hcl --interactive
 cloudslayer compare ./terraform/ --interactive
+```
+
+Add `--live` to bypass cache reads and force fresh pricing API calls for that run (useful when you want the TUI to show only live-sourced prices):
+
+```bash
+cloudslayer analyze ./terraform/ --interactive --live
 ```
 
 ![cloudslayer analyze TUI](assets/tui-analyze.svg)
@@ -227,6 +233,7 @@ cloudslayer plan infra.hcl --format markdown   # GitHub-flavored tables for PR c
 cloudslayer plan infra.hcl --format json       # machine-readable
 cloudslayer plan infra.hcl --fail-if-over 500  # exit 2 if cheapest combo > $500/mo
 cloudslayer diff before.hcl after.hcl          # cost delta between two specs
+cloudslayer plan infra.hcl --fallback          # permit verified static AWS/Azure fallback rates
 ```
 
 ## Supported providers
@@ -237,7 +244,7 @@ All prices are for `us-east-1` / `East US` / `us-east1` by default — change wi
 
 | Provider           | 2 vCPU / 4 GB | 4 vCPU / 16 GB | Pricing source |
 |--------------------|--------------:|---------------:|----------------|
-| GCP Compute Engine |     $24.11/mo |      $96.14/mo | Verified monthly |
+| GCP Compute Engine |     live result |      live result | Cloud Billing API (authenticated) or live Vantage data |
 | AWS EC2            |     $24.53/mo |      $98.11/mo | Live (Bulk Pricing API) |
 | Azure VM           |     $30.37/mo |     $121.18/mo | Live (Retail Prices API) |
 
@@ -282,7 +289,10 @@ Run `cloudslayer providers` to see live sources and last-verified dates.
 | `cloudslayer providers`                      | List providers, pricing sources, last-verified dates |
 | `cloudslayer cache status \| clear`          | Manage the local pricing cache                       |
 
-Add `--interactive` to `plan`, `compare`, or `analyze` for the TUI, `--region` to price a different region, `--format json|markdown` for machine-readable output.
+Add `--interactive` to `plan`, `compare`, or `analyze` for the TUI, `--region` to price a different region, and `--format json|markdown` for machine-readable output. Add `--fallback` to pricing commands only when you explicitly accept verified static AWS/Azure rates; GCP never uses hard-coded fallback prices.
+Add `--live` to pricing commands to skip local cache reads and force fresh API fetches.
+
+The interactive comparison keeps pricing provenance on-screen: each row is labeled `live`, `cache`, `third-party live`, or `fallback`, with source URLs in the detail pane. Unavailable providers are shown in a persistent warning panel. The TUI also states that alternatives satisfy declared capacity rather than guaranteeing benchmark equivalence, and strategy savings are explicitly labeled as modeled estimates.
 
 ## Strategy engine — full list
 
@@ -294,7 +304,6 @@ Add `--interactive` to `plan`, `compare`, or `analyze` for the TUI, `--region` t
 | Right-size over-provisioned   | 25–50%         | Low    | Low    |
 | Instance Scheduler (non-prod) | 60–70%         | Low    | Low    |
 | Storage lifecycle rules       | 20–40%         | Low    | Low    |
-| Region shift                  | 5–7%           | Low    | Low    |
 | AWS Spot / GCP Preemptible    | 60–80%         | Low    | Medium |
 
 **Tier 2 — Commitment purchases** (no migration, just buy)
@@ -315,7 +324,7 @@ Add `--interactive` to `plan`, `compare`, or `analyze` for the TUI, `--region` t
 
 ## Pricing accuracy
 
-AWS and Azure prices are fetched live from official pricing APIs and cached for 7 days (`cloudslayer cache status`). GCP prices are hardcoded with verified dates. Every resource comparison shows its pricing source, and `cloudslayer scan` lists any detected resources that are *not* included in the estimate.
+AWS and Azure prices are fetched from their public pricing APIs and cached for 7 days (`cloudslayer cache status`). GCP uses the authenticated Cloud Billing Catalog API; Compute Engine may use live Vantage data when credentials are unavailable. GCP has no hard-coded price fallback. By default, a provider with no live or usable cached price is omitted with a visible warning. `--fallback` explicitly enables verified static AWS/Azure values, and every returned result carries a pricing-source label. Use `--live` to bypass local cache reads and force fresh pricing API calls for that run.
 
 > **Disclaimer:** Prices are estimates for planning purposes. Always verify against official provider pricing pages before making commitments. Actual bills depend on usage patterns, negotiated discounts, support tiers, data transfer, and region.
 

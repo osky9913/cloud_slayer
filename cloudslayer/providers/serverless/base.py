@@ -25,10 +25,18 @@ class ServerlessProvider(ABC):
             monthly_cost=round(monthly, 4),
             per_million_requests=round(per_million, 4),
             notes=self._notes(),
+            price_source=self._price_source(),
+            source_url=self._source_url(),
         )
 
     @abstractmethod
     def _monthly_cost(self, spec: ServerlessSpec) -> float: ...
 
     def _notes(self) -> str:
+        return ""
+
+    def _price_source(self) -> str:
+        return "fallback"
+
+    def _source_url(self) -> str:
         return ""

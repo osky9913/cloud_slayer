@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from ...models import ComputeResult, ComputeSpec
+from ...pricing import PricingUnavailableError
 
 
 @dataclass
@@ -13,6 +14,8 @@ class InstanceType:
     memory_gb: float
     price_per_month: float
     notes: str = ""
+    price_source: str = ""
+    source_url: str = ""
 
 
 class ComputeProvider(ABC):
@@ -33,8 +36,17 @@ class ComputeProvider(ABC):
         ]
         return min(candidates, key=lambda i: i.price_per_month) if candidates else None
 
-    def calculate_cost(self, spec: ComputeSpec) -> ComputeResult | None:
-        match = self.find_match(spec)
+    def calculate_cost(self, spec: ComputeSpec, instance_name: str = "") -> ComputeResult | None:
+        match = (
+            next((item for item in self.catalog() if item.name == instance_name), None)
+            if instance_name
+            else self.find_match(spec)
+        )
+        if instance_name and match is None:
+            raise PricingUnavailableError(
+                self.display_name,
+                f"no price was returned for exact instance {instance_name!r}",
+            )
         if not match:
             return None
         return ComputeResult(
@@ -45,4 +57,6 @@ class ComputeProvider(ABC):
             instance_memory_gb=match.memory_gb,
             price_per_month=match.price_per_month,
             notes=match.notes,
+            price_source=match.price_source,
+            source_url=match.source_url,
         )

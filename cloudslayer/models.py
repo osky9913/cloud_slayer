@@ -28,6 +28,7 @@ class StoragePricing:
     notes: str = ""
     source_url: str = ""
     last_verified: str = ""
+    price_source: str = ""
 
 
 @dataclass
@@ -38,6 +39,8 @@ class CostResult:
     request_cost: float
     egress_cost: float
     notes: str = ""
+    price_source: str = ""
+    source_url: str = ""
 
     @property
     def total(self) -> float:
@@ -63,6 +66,8 @@ class ComputeResult:
     instance_memory_gb: float
     price_per_month: float
     notes: str = ""
+    price_source: str = ""
+    source_url: str = ""
 
     @property
     def total(self) -> float:
@@ -91,6 +96,8 @@ class DatabaseResult:
     instance_cost: float
     storage_cost: float
     notes: str = ""
+    price_source: str = ""
+    source_url: str = ""
 
     @property
     def total(self) -> float:
@@ -115,3 +122,9 @@ class ServerlessResult:
     monthly_cost: float
     per_million_requests: float
     notes: str = ""
+    price_source: str = ""
+    source_url: str = ""
+
+    @property
+    def total(self) -> float:
+        return self.monthly_cost

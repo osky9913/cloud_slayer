@@ -10,7 +10,8 @@ from pathlib import Path
 
 import requests
 
-from ....config import get_aws_region
+from ....config import fallback_prices_enabled, force_live_prices_enabled, get_aws_region
+from ....pricing import PricingUnavailableError
 from ..base import ComputeProvider, InstanceType
 
 CACHE_DIR = Path.home() / ".cloudslayer" / "cache"
@@ -179,7 +180,15 @@ def _notes(name: str) -> str:
 
 
 _CATALOG = [
-    InstanceType(name, vcpu, mem, _FALLBACK_PRICES[name], _notes(name))
+    InstanceType(
+        name,
+        vcpu,
+        mem,
+        _FALLBACK_PRICES[name],
+        _notes(name),
+        "fallback",
+        "https://aws.amazon.com/ec2/pricing/on-demand/",
+    )
     for name, (vcpu, mem) in _INSTANCE_SPECS.items()
 ]
 
@@ -196,21 +205,34 @@ class AWSEC2Provider(ComputeProvider):
     def catalog(self) -> list[InstanceType]:
         try:
             return self._live_catalog()
-        except Exception:
-            return _CATALOG
+        except Exception as error:
+            if fallback_prices_enabled():
+                return _CATALOG
+            raise PricingUnavailableError(
+                self.display_name,
+                f"live pricing unavailable ({error}); rerun with --fallback to use verified static AWS prices",
+            ) from error
 
     def _live_catalog(self) -> list[InstanceType]:
         region = get_aws_region()
         cache_file = CACHE_DIR / f"aws_ec2_prices_{region}.json"
-        if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < CACHE_TTL:
+        if (
+            not force_live_prices_enabled()
+            and cache_file.exists()
+            and (time.time() - cache_file.stat().st_mtime) < CACHE_TTL
+        ):
             with open(cache_file) as f:
-                return _build_catalog(json.load(f))
+                return _build_catalog(json.load(f), "cache")
         try:
             return self._fetch_and_cache(cache_file)
         except Exception:
-            if cache_file.exists():
+            if (
+                not force_live_prices_enabled()
+                and cache_file.exists()
+                and fallback_prices_enabled()
+            ):
                 with open(cache_file) as f:
-                    return _build_catalog(json.load(f))
+                    return _build_catalog(json.load(f), "stale cache")
             raise
 
     def _fetch_and_cache(self, cache_file: Path) -> list[InstanceType]:
@@ -234,7 +256,7 @@ class AWSEC2Provider(ComputeProvider):
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             with open(cache_file, "w") as f:
                 json.dump(prices, f)
-            return _build_catalog(prices)
+            return _build_catalog(prices, "live")
         finally:
             if tmp_path:
                 try:
@@ -276,8 +298,17 @@ def _extract_ec2_prices(data: dict) -> dict[str, float]:
     return prices
 
 
-def _build_catalog(prices: dict[str, float]) -> list[InstanceType]:
+def _build_catalog(prices: dict[str, float], source: str = "live") -> list[InstanceType]:
     return [
-        InstanceType(name, vcpu, mem, prices.get(name, _FALLBACK_PRICES[name]), _notes(name))
+        InstanceType(
+            name,
+            vcpu,
+            mem,
+            prices.get(name, _FALLBACK_PRICES[name]),
+            _notes(name),
+            source if name in prices else "fallback",
+            "https://aws.amazon.com/ec2/pricing/on-demand/",
+        )
         for name, (vcpu, mem) in _INSTANCE_SPECS.items()
+        if name in prices or fallback_prices_enabled()
     ]

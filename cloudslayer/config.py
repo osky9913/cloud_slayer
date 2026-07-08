@@ -22,6 +22,8 @@ REGION_MAP: dict[str, tuple[str, str]] = {
 }
 
 _DEFAULT = "us-east-1"
+_ALLOW_FALLBACK_PRICES = False
+_FORCE_LIVE_PRICES = False
 
 
 def get_aws_region() -> str:
@@ -41,3 +43,23 @@ def get_azure_region() -> str:
 def set_region(aws_region: str) -> None:
     """Set the active region (used by CLI --region flag)."""
     os.environ["CLOUDSLAYER_REGION"] = aws_region
+
+
+def set_fallback_prices(enabled: bool) -> None:
+    """Control whether verified static AWS/Azure prices may be used."""
+    global _ALLOW_FALLBACK_PRICES
+    _ALLOW_FALLBACK_PRICES = enabled
+
+
+def fallback_prices_enabled() -> bool:
+    return _ALLOW_FALLBACK_PRICES
+
+
+def set_force_live_prices(enabled: bool) -> None:
+    """Control whether pricing cache reads are bypassed and live sources are always queried."""
+    global _FORCE_LIVE_PRICES
+    _FORCE_LIVE_PRICES = enabled
+
+
+def force_live_prices_enabled() -> bool:
+    return _FORCE_LIVE_PRICES
